@@ -8,12 +8,19 @@
 # 2026-10-20: while a GPU newdecode runs (peaks ~31 GB), at most V7_ND_DECODES (4) capture decodes run.
 # 2026-10-21: one HDD-heavy job (ld-dropout-correct / ffmpeg concat) at a time; 3 together got ~12 MB/s.
 # Linux nice is per thread: every thread of every matching process and its descendants is reniced.
+# /proc comm is cut to 15 characters ("ld-dropout-corr"), so dropout-correct is matched by prefix.  On exit
+# (TERM / INT / HUP too) every process this scheduler stopped is sent SIGCONT, so stopping it never leaves
+# decodes frozen.
 . "$(dirname "${BASH_SOURCE[0]}")/conf.sh"
 NDEC=${V7_STACK_DECODES:-2}
 tree(){ local p; for p in "$@"; do echo $p; tree $(pgrep -P $p); done; }
 setn(){ local n=$1 p t; shift
   for p in $(tree $(pgrep -f "$1")); do for t in /proc/$p/task/*; do
     [ "$(awk '{print $19}' $t/stat 2>/dev/null)" = "$n" ] || renice -n $n -p ${t##*/} > /dev/null 2>&1; done; done; }
+STOPPED=                                                           # pids this scheduler has SIGSTOPped
+resume_all(){ local p; for p in $STOPPED; do kill -CONT $(tree $p) 2> /dev/null; done; STOPPED=; }
+trap 'resume_all' EXIT
+trap 'v7log "prio: stopped by signal - resuming all paused processes"; exit 0' TERM INT HUP
 last=
 while :; do
   setn 15 '[l]d-decode --PAL'
@@ -33,10 +40,11 @@ while :; do
   i=0
   # 2026-10-24: only the real ld-dropout-correct / ffmpeg processes (not shells whose command text mentions
   # them) and only on the hard disks (V7_HDD_RE: paths on S: / T:; E: is NVMe)
-  for p in $(ps -eo pid,etimes,comm,args --sort=-etimes | awk -v hdd="${V7_HDD_RE:-/mnt/[st]/}" '($3 == "ld-dropout-co" || $3 == "ld-dropout-correct") && $0 ~ hdd {print $1} $3 == "ffmpeg" && /-f concat/ && $0 ~ hdd {print $1}'); do
+  for p in $(ps -eo pid,etimes,comm,args --sort=-etimes | awk -v hdd="${V7_HDD_RE:-/mnt/[st]/}" '$3 ~ /^ld-dropout-co/ && $0 ~ hdd {print $1} $3 == "ffmpeg" && /-f concat/ && $0 ~ hdd {print $1}'); do
     i=$((i + 1)); if [ $i = 1 ]; then kill -CONT $p 2> /dev/null; else kill -STOP $p 2> /dev/null; st="$st io:$p"; fi
   done
   [ "$st" != "$last" ] && v7log "prio: keep $keep - capture decodes paused:${st:- none}"
   last=$st
-  sleep 60
+  STOPPED=$(echo "$STOPPED ${st//io:/}" | tr ' ' '\n' | awk 'NF && !s[$0]++' | while read -r p; do kill -0 "$p" 2> /dev/null && echo "$p"; done | tr '\n' ' ')
+  sleep 60 & wait $!                                                # (a signal is handled at once, not after the sleep)
 done

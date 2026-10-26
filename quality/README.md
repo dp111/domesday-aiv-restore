@@ -40,7 +40,8 @@ TBC / defect handling on real captures too.
 ## 2. Whole-side record (every field of a real stack, no reference)
 
 `fq_side.py <side.tbc> <out.csv> [--vits]`: one read of the stacked TBC; per field the blank-line noise per
-band, residual dropout samples and (with --vits) ld-process-vits white SNR / black PSNR.  Content
+band, residual dropout samples and (with --vits) ld-process-vits white SNR / black PSNR (parsed from its -d
+output; 0 = not measured = NULL).  Content
 independent, so frames and versions compare directly; flags weak stretches of a side.  The cross-master
 blend works on the active picture only, so these lines show the primary-master stack.
 
@@ -49,13 +50,15 @@ blend works on the active picture only, so these lines show the primary-master s
 `quality_db.py` keeps one SQLite database (`quality.db` here, or `FQ_DB`) with a run per side and pipeline
 version: `runs`, `stack_frames` (stacker LDSTACK_FRAME_STATS: captures available/used, alt-master use, pixels
 filled/repaired, residual dropouts), `fields` (`fq_side.py`), `nd_frames` (newdecode saturation guard and frame
-class) and `pvf_frames` (`pvf_quality.sh`: PSNR/SSIM of the PVF encode against its master).  The view
-`frame_quality` joins them per frame.  `pipeline/side.sh` fills it at the end of each side;
+class) and `pvf_frames` (`pvf_quality.sh`: PSNR/SSIM of the PVF encode against its master, frame n against
+frame n by `pvf_rawcmp.py`; it fails unless the PVF and master frame counts match).  The view
+`frame_quality` joins them per frame (every frame any table has).  `pipeline/side.sh` fills it at the end of each side;
 `quality_db.py summary` prints one line per run.
 
 ## 4. Dropout-fill test (`dofill/`)
 
-`prep.py` injects real dropout shapes into a benchmark stack, `run.sh` decodes the fill variants, `score_do.py`
+`prep.py` injects real dropout shapes into a benchmark stack, `run.sh <benchdir>` prepares what is missing
+(prep.py, the ld-dropout-correct copy fill, the doc.tbc links) and decodes the fill variants, `score_do.py`
 scores the error inside the dropouts and `temporal.py` tries the previous/next-frame fill offline.  Results
 (`RESULTS.txt`) chose newdecode's defaults PALDEC_DOI=replace and PALDEC_DOT=1.5 (`newdecode/README_dropout.txt`).
 

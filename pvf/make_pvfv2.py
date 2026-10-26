@@ -316,66 +316,72 @@ def encode_audio(args, pcm_path):
         return False
 
 
+def _codes(data, lo):
+    """(offset, NAL type, scan resume) of each Annex-B start code in data[lo:],
+    exactly as a byte-by-byte scan finds them: 00 00 00 01 when the zero before
+    00 00 01 is not part of the previous code, else 00 00 01; the scan resumes
+    at the NAL header byte.  bytes.find keeps it linear."""
+    n, r = len(data), lo
+    while True:
+        p = data.find(b"\0\0\1", r)
+        if p < 0 or p + 3 >= n:
+            return
+        yield (p - 1 if p - 1 >= r and data[p - 1] == 0 else p), data[p + 3] & 0x1F, p + 3
+        r = p + 3
+
+
+def start_codes(data):
+    """(offset, NAL type) of each start code in an in-memory stream."""
+    return ((s, nal) for s, nal, _ in _codes(data, 0))
+
+
+def file_start_codes(f, block=1 << 26):
+    """start_codes over a file read in blocks (absolute offsets), so a
+    multi-GB stream is never held in memory."""
+    buf, base, r, eof = b"", 0, 0, False
+    while True:
+        for s, nal, nr in _codes(buf, max(r - base, 0)):
+            yield base + s, nal
+            r = base + nr
+        if eof:
+            return
+        # an unfinished code needs at most the last 4 bytes, and nothing before r
+        keep = max(r, base + len(buf) - 4)
+        more = f.read(block)
+        eof = not more
+        buf, base = buf[keep - base:] + more, keep
+
+
 def split_nal_types(au):
     """NAL types present in one access unit."""
-    out, i = [], 0
-    while i + 3 < len(au):
-        if au[i:i + 3] == b"\0\0\1":
-            out.append(au[i + 3] & 0x1F)
-            i += 3
-        elif i + 4 < len(au) and au[i:i + 4] == b"\0\0\0\1":
-            out.append(au[i + 4] & 0x1F)
-            i += 4
-        else:
-            i += 1
-    return out
+    return [nal for _, nal in start_codes(au)]
 
 
-def split_access_units(data):
-    """Split an Annex-B byte stream into access units.
+def access_unit_starts(codes):
+    """AU start offsets from the start codes (offset, NAL type), in order.
 
     With repeat-headers + keyint=1 every frame is SPS PPS [SEI] IDR, so a
     new AU starts at each SPS (NAL type 7). Also honour access-unit
-    delimiters (type 9) if present."""
-    positions = []          # (offset_of_start_code, nal_type)
-    i = 0
-    n = len(data)
-    while i < n - 3:
-        if data[i] == 0 and data[i + 1] == 0:
-            if data[i + 2] == 1:
-                positions.append((i, data[i + 3] & 0x1F))
-                i += 3
-                continue
-            if data[i + 2] == 0 and i < n - 4 and data[i + 3] == 1:
-                positions.append((i, data[i + 4] & 0x1F))
-                i += 4
-                continue
-        i += 1
-
-    if not positions:
-        sys.exit("error: no NAL units found - is this an Annex-B H264 stream?")
-
-    au_starts = [off for off, nal in positions if nal in (7, 9)]
-    # De-duplicate AUD-followed-by-SPS
-    starts = []
-    last = -1
-    for off in au_starts:
-        # Two boundary markers with no VCL NAL between them = same AU
-        if starts and not any(
-            nal in (1, 5) for o, nal in positions if starts[-1] <= o < off
-        ):
-            continue
-        if off != last:
+    delimiters (type 9) if present; two boundary markers with no VCL NAL
+    (type 1 or 5) between them belong to the same AU."""
+    starts, vcl = [], False
+    for off, nal in codes:
+        if nal in (7, 9) and (not starts or vcl):
             starts.append(off)
-            last = off
+            vcl = False
+        elif nal in (1, 5):
+            vcl = True
+    if not starts:
+        sys.exit("error: no NAL units found - is this an Annex-B H264 stream?")
     if starts[0] != 0:
         starts.insert(0, 0)
+    return starts
 
-    aus = []
-    for idx, off in enumerate(starts):
-        end = starts[idx + 1] if idx + 1 < len(starts) else n
-        aus.append(data[off:end])
-    return aus
+
+def split_access_units(data):
+    """Split an in-memory Annex-B byte stream into access units."""
+    starts = access_unit_starts(start_codes(data)) + [len(data)]
+    return [data[a:b] for a, b in zip(starts, starts[1:])]
 
 
 def parse_aspect(text):
@@ -425,6 +431,10 @@ def main():
                         "(the pre-2026-09-07 behaviour, 0.65%% narrow)")
     p.add_argument("--start", default=None, help="ffmpeg -ss start point")
     p.add_argument("--frames", type=int, default=None, help="limit frame count")
+    p.add_argument("--expect-frames", type=int, default=None,
+                   help="fail (no output written) unless exactly this many frames "
+                        "were encoded, e.g. the master's frame count: a reader "
+                        "that died early only shortens the input stream")
     p.add_argument("--no-audio", action="store_true")
     p.add_argument("--dedupe", action="store_true",
                    help="store each held still once: repeats of a run's first frame "
@@ -467,28 +477,24 @@ def main():
         dup = encode_video(args, par, h264_path)
         has_audio = (not args.no_audio) and encode_audio(args, pcm_path)
 
-        with open(h264_path, "rb") as f:
-            aus = split_access_units(f.read())
-        pcm = b""
-        if has_audio:
-            with open(pcm_path, "rb") as f:
-                pcm = f.read()
+        # 2026-10-26: the stream and the sound are no longer read into memory
+        # (a 3.5 GB PVF took ~3x its size in RAM): AU boundaries come from one
+        # block-wise scan, the index from the AU sizes, then the records are
+        # copied from the files.  Same bytes out as before.
+        h264 = open(h264_path, "rb")
+        n_bytes = os.fstat(h264.fileno()).st_size
+        starts = access_unit_starts(file_start_codes(h264)) + [n_bytes]
+        extents = list(zip(starts, starts[1:]))
+        pcm = open(pcm_path, "rb") if has_audio else None
+        pcm_len = os.fstat(pcm.fileno()).st_size if has_audio else 0
 
-        frame_count = len(aus)
+        frame_count = len(extents)
         print(f"{frame_count} access units")
         if dup is not None and len(dup) != frame_count:
             sys.exit(f"error: duplicate scan saw {len(dup)} frames, encoder {frame_count}")
-
-        # Every AU must be standalone-decodable: at least one IDR slice
-        # (type 5) and no non-IDR slices (types 1-4). A leading SEI-only
-        # "AU" (possible if the stream did not start with an SPS) or any
-        # inter-coded slice would stall the player's frame accounting.
-        for i, au in enumerate(aus):
-            types = split_nal_types(au)
-            if 5 not in types or any(t in (1, 2, 3, 4) for t in types):
-                sys.exit(f"error: access unit {i} is not a standalone IDR "
-                         f"picture (NAL types {types}) - encoder settings "
-                         "changed?")
+        if args.expect_frames is not None and frame_count != args.expect_frames:
+            sys.exit(f"error: {frame_count} frames encoded, expected {args.expect_frames} "
+                     "(input truncated?)")
 
         # Per-frame audio slice sizes (fractional accumulation keeps sync
         # for frame rates that do not divide the sample rate)
@@ -499,29 +505,34 @@ def main():
             s1 = (i + 1) * args.audio_rate * args.fps_den // args.fps_num
             return s0 * bytes_per_sample_pair, s1 * bytes_per_sample_pair
 
+        def audio_chunk(i):
+            if not has_audio:
+                return b""
+            a0, a1 = audio_slice(i)
+            pcm.seek(min(a0, pcm_len))
+            chunk = pcm.read(a1 - a0)
+            if len(chunk) < a1 - a0:      # pad tail with silence
+                chunk += b"\0" * (a1 - a0 - len(chunk))
+            return chunk
+
         nominal = (args.audio_rate * args.fps_den // args.fps_num) * bytes_per_sample_pair
 
         header_size = 64
         index_offset = header_size
         data_offset = index_offset + 4 * frame_count
 
+        # pass 1: the index (record sizes only)
         index = []
-        records = []
+        stored = []                 # per frame: True = has its own record
         offset = data_offset
         max_video = 0
         shared = 0
         rep_chunk = None
-        for i, au in enumerate(aus):
-            vlen = len(au)
+        for i, (a0, a1) in enumerate(extents):
+            vlen = a1 - a0
             max_video = max(max_video, vlen)
             vpad = (-vlen) % 4
-            if has_audio:
-                a0, a1 = audio_slice(i)
-                chunk = pcm[a0:a1]
-                if len(chunk) < a1 - a0:      # pad tail with silence
-                    chunk += b"\0" * (a1 - a0 - len(chunk))
-            else:
-                chunk = b""
+            chunk = audio_chunk(i)
             # A repeat of a held still whose audio is also identical (in
             # practice: silent) shares its run's first record: the index
             # entry points back at it.  Index offsets are then no longer
@@ -531,12 +542,12 @@ def main():
                     rep_chunk = chunk
                 elif chunk == rep_chunk:
                     index.append(index[dup[i]])
+                    stored.append(False)
                     shared += 1
                     continue
-            rec = struct.pack("<II", vlen, len(chunk)) + au + b"\0" * vpad + chunk
             index.append(offset)
-            records.append(rec)
-            offset += len(rec)
+            stored.append(True)
+            offset += 8 + vlen + vpad + len(chunk)
             if offset >= 0xFFFFFFFF:
                 sys.exit("error: output exceeds 4GB (FAT32/PVF limit) - "
                          "raise --crf or split the disc")
@@ -556,11 +567,36 @@ def main():
             0,
         )
 
-        with open(args.output, "wb") as out:
-            out.write(header)
-            out.write(struct.pack(f"<{frame_count}I", *index))
-            for rec in records:
-                out.write(rec)
+        # pass 2: write, one access unit at a time.  Every AU must be
+        # standalone-decodable: at least one IDR slice (type 5) and no
+        # non-IDR slices (types 1-4). A leading SEI-only "AU" (possible if
+        # the stream did not start with an SPS) or any inter-coded slice
+        # would stall the player's frame accounting.
+        try:
+            with open(args.output, "wb") as out:
+                out.write(header)
+                out.write(struct.pack(f"<{frame_count}I", *index))
+                for i, (a0, a1) in enumerate(extents):
+                    h264.seek(a0)
+                    au = h264.read(a1 - a0)
+                    types = split_nal_types(au)
+                    if 5 not in types or any(t in (1, 2, 3, 4) for t in types):
+                        sys.exit(f"error: access unit {i} is not a standalone IDR "
+                                 f"picture (NAL types {types}) - encoder settings "
+                                 "changed?")
+                    if not stored[i]:
+                        continue
+                    chunk = audio_chunk(i)
+                    out.write(struct.pack("<II", len(au), len(chunk)))
+                    out.write(au)
+                    out.write(b"\0" * ((-len(au)) % 4))
+                    out.write(chunk)
+        except BaseException:
+            try:
+                os.unlink(args.output)
+            except OSError:
+                pass
+            raise
 
         total = offset
         if dup is not None:

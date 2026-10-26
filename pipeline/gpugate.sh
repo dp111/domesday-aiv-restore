@@ -4,6 +4,9 @@
 # lock slots are usable, and this gate keeps it to one newdecode at a time (each peaks ~32 GB):
 # PAUSE_gpu (honoured by acquire) while an nd_gpuwrap runs or a gpu lock was taken in the last 5 minutes
 # (its newdecode may not have started yet).
+# This gate polls (10 s), so two sides could still both start a newdecode inside one window; the
+# exclusivity itself is atomic: nd_chunked.sh holds an exclusive flock on $ND_GPULOCK ($WORK/state/gpu.lock)
+# through its chunk loop (newdecode inherits it), and a second side waits on it.  A held lock counts as busy.
 . "$(dirname "${BASH_SOURCE[0]}")/conf.sh"
 last=
 while :; do
@@ -13,6 +16,7 @@ while :; do
   # its chunks (concat + ffprobe, CPU/disk only: 10-24 the GPU sat idle through EcoDisc_S1's)
   # (the final .mkv.tmp.mkv check only, not the per-chunk ffprobe of chunk_NN.mkv)
   [ -z "$busy" ] && pgrep -f '[n]d_chunked.sh' > /dev/null && ! pgrep -f '[f]fmpeg .*-f concat|[f]fprobe .*\.mkv\.tmp\.mkv' > /dev/null && busy=newdecode
+  [ -z "$busy" ] && ! flock -n "${ND_GPULOCK:-$V7/gpu.lock}" true 2> /dev/null && busy="newdecode (GPU lock)"
   for o in "$V7"/locks/gpu.*/owner; do
     [ -e "$o" ] && [ $(( $(date +%s) - $(stat -c %Y "$o") )) -lt 300 ] && busy=${busy:-new lock}
   done

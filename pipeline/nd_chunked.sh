@@ -11,6 +11,11 @@
 # after a run start differ materially; elsewhere run-to-run GPU noise (max ~1 8-bit level).
 # newdecode runs under nd_gpuwrap.py (frees the PyTorch GPU cache before cuFFT flow; see there).
 # Then: concat + audio -> $V7_OUT/<side>.<tag>.mkv, a decode log with a summed done line and satratio.
+# The chunks are tied to the doc.tbc they came from ($C/doc.id: its size + mtime); a new doc.tbc (restack)
+# discards them, and chunks without that stamp are kept only if newer than doc.tbc.
+# GPU exclusivity is atomic: the chunk loop holds an exclusive flock on $ND_GPULOCK ($WORK/state/gpu.lock),
+# inherited by newdecode, so two sides cannot both start a newdecode inside gpugate.sh's polling window;
+# it is released before the concat, so the next side's decode overlaps that.
 set -u
 set -o pipefail
 S=$1 SCR=$2 APCM=$3 TAG=${4:-v6}
@@ -38,7 +43,24 @@ nframes(){ ffprobe -v error -count_packets -select_streams v:0 -show_entries str
 mkdir -p "$C"
 N=$(( $(stat -c %s "$SCR/doc.tbc") / (1135 * 313 * 2 * 2) ))
 NC=$(( (N + CH - 1) / CH ))
+DID=$(stat -c '%s %Y' "$SCR/doc.tbc")
+if [ -s "$C/doc.id" ] && [ "$(cat "$C/doc.id")" != "$DID" ]; then
+  log "chunked newdecode $S: doc.tbc changed since the chunks were made - discarding them"
+  rm -rf "$C"/chunk_* "$C"/sat_*.txt "$C"/cls_*.txt "$C"/w[0-9]*
+elif [ ! -s "$C/doc.id" ]; then
+  for m in "$C"/chunk_*.mkv; do
+    [ -e "$m" ] && [ "$m" -ot "$SCR/doc.tbc" ] && { K=${m##*/chunk_}; K=${K%.mkv}; rm -f "$m" "$C/chunk_$K.log" "$C/sat_$K.txt" "$C/cls_$K.txt"; log "chunk $K older than doc.tbc - discarded"; }
+  done
+fi
+echo "$DID" > "$C/doc.id"
 log "chunked newdecode $S: $N frames in $NC chunks of $CH (+-$PAD lead) -> $C (decoder $CD ${ND_EXTRA:-})"
+GL=${ND_GPULOCK:-$WORK/state/gpu.lock}
+mkdir -p "$(dirname "$GL")"; exec 9> "$GL" || die "cannot open GPU lock $GL"
+if ! flock -n 9; then
+  log "chunked newdecode $S: waiting for the GPU (another newdecode holds $GL)"
+  flock 9 || die "GPU lock $GL failed"
+  log "chunked newdecode $S: GPU lock taken"
+fi
 
 for ((k = 0; k < NC; k++)); do
   s=$((k * CH)); e=$((s + CH)); [ $e -gt $N ] && e=$N
@@ -62,6 +84,7 @@ for ((k = 0; k < NC; k++)); do
   rm -rf "$C/w$K"
   log "chunk $K ($s-$e) OK $(stat -c%s "$M") bytes"
 done
+flock -u 9; exec 9>&-                  # GPU free: the concat + checks below are CPU / disk only
 
 ls "$C"/chunk_*.mkv | sed "s/.*/file '&'/" > "$C/list.txt"
 ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "$C/list.txt" -f s16le -ar 44100 -ac 2 -i "$APCM" \

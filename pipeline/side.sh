@@ -4,13 +4,16 @@
 #   -> stack: ld-decode lddecode.stack --cross_master [--clv] (2 stack slots)
 #   -> automatic stack QC -> squelch audio -> ld-dropout-correct
 #   -> chunked newdecode (newdecode/, --dropout_mask 1; 1 GPU slot) -> master <side>.v8.mkv, yuv422p10le
-#   -> PVF (still-weave, CRF 17 [18 if >= 4 GB], dedupe) -> BeebVFS slot, previous PVF kept as video.pvf.pre-v8
+#   -> PVF (still-weave, CRF 17 [18, 19, 20 while >= 4 GB], dedupe) -> BeebVFS slot, previous PVF kept as video.pvf.pre-v8
 #   -> per-frame quality record in quality/quality.db
 # Slots are handed out in side order (an earlier side waiting for a slot goes first).
 # The stack is gated automatically on frame count and, if V7_OLDF holds an earlier stack of the side, on
 # stack_quality.py's predicted noise; a failed gate HOLDs only this side ($V7/HOLD.<side>, remove it to continue).
 # $V7/AUTODELETE: delete this side's capture decodes once its stack + dropout-correct are done.
 # Resumable: the stack, doc.tbc, chunks and MKV are reused.  Log prefix "AIV <side>".
+# Each product made from the stack (stackqc.ok, doc.tbc, MKV, PVF, quality record) carries a stamp of the
+# stack it was made from (<product>.stackid: size + mtime of the stack .tbc) and is redone when the stack
+# changes; a product without a stamp counts only if newer than the stack.
 set -u
 set -o pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/conf.sh"
@@ -29,10 +32,20 @@ die(){ log "STOPPING: $*"; exit 1; }
 sethold(){ touch "$HOLDF"; log "HOLD set: $*"; while [ -e "$HOLDF" ]; do sleep 60; done; log "HOLD released"; }
 nframes(){ ffprobe -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of csv=p=0 "$1" 2>/dev/null; }
 acquire(){ # <resource> <slots>: wait for a free slot; earlier sides first
-  local w=$V7/wait/$1.$ORD i first
-  mkdir -p "$V7/wait" "$V7/locks"; touch "$w"
+  # the wait file holds "<side> <pid>"; one whose pid is gone (side died) is removed instead
+  # of blocking every later side.  An EMPTY wait file (no pid) is a manual hold: it is never removed.
+  local w=$V7/wait/$1.$ORD i first e p
+  mkdir -p "$V7/wait" "$V7/locks"; echo "$SIDE $$" > "$w.tmp$$" && mv -f "$w.tmp$$" "$w"
   while :; do
-    first=$(ls "$V7/wait" | grep "^$1\." | sort | head -1)
+    first=
+    for e in $(ls "$V7/wait" | grep "^$1\.[0-9]*$" | sort); do
+      [ "$e" = "$1.$ORD" ] && { first=$e; break; }
+      p=$(awk '{print $NF}' "$V7/wait/$e" 2>/dev/null)
+      if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then
+        rm -f "$V7/wait/$e"; log "stale wait entry $e removed (pid $p gone)"; continue
+      fi
+      first=$e; break                    # a live earlier side, or a manual hold (empty file)
+    done
     if [ "$first" = "$1.$ORD" ] && [ ! -e "$V7/PAUSE_$1" ]; then
       for ((i = 1; i <= $2; i++)); do
         # a second GPU decoder (+1.5x throughput, ~15 GB RAM each) only with room to spare
@@ -84,38 +97,57 @@ fi
 [ -s "$STKO.tbc.json" ] || "$PY" "$LD/scripts/db2json.py" "$STKO.tbc.db" > /dev/null 2>&1
 [ -s "$STKO.tbc.json" ] || die "no stack json"
 NFR=$(( $(stat -c %s "$STKO.tbc") / FB ))
+SID=$(stat -c '%s %Y' "$STKO.tbc")        # stack identity: a restack changes it
+stamped(){ # <product> <stamp>: made from this stack (stamp matches; no / empty stamp: product newer than the stack)
+  if [ -s "$2" ]; then [ "$(cat "$2")" = "$SID" ]; else [ -e "$1" ] && [ ! "$1" -ot "$STKO.tbc" ]; fi; }
+stamp(){ echo "$SID" > "$1"; }
 
 # ---- automatic stack QC (frame count and predicted noise against an earlier stack, if any) ----
-if [ ! -e "$SCR/stackqc.ok" ]; then
+if ! stamped "$SCR/stackqc.ok" "$SCR/stackqc.ok"; then
+  [ -e "$SCR/stackqc.ok" ] && log "stack changed since the last stack QC - redoing it and everything made from the stack"
   qc=ok
   ON=$(( $(stat -c %s "$OLDF/$SIDE.tbc" 2>/dev/null || echo 0) / FB ))
   [ "$ON" -gt 0 ] && [ "$NFR" -lt $((ON - 100)) ] && qc="only $NFR frames against the earlier stack's $ON"
+  [ "$ON" -gt 0 ] || log "stack QC: no earlier stack ${OLDF:+$OLDF/$SIDE.tbc }- frame-count check SKIPPED"
   OL=$OLDF/${SIDE}_stack_redo.log; [ -s "$OL" ] || OL=$OLDF/${SIDE}_stack.log
   if [ ${#ins[@]} -gt 1 ] && [ -s "$OL" ]; then
-    q=$("$PY" "$B/stack_quality.py" "$OL" "$SL" 2>&1 | tr '\n' ' ')
+    # noise normalised to each stack's json white-black range (the decoders' levels differ)
+    q=$("$PY" "$B/stack_quality.py" "$OL=$OLDF/$SIDE.tbc.json" "$SL=$STKO.tbc.json" 2>&1 | tr '\n' ' ')
     log "stack quality (predicted noise; earlier then new): $q"
-    B=$B "$PY" - "$OL" "$SL" <<'E' || qc="predicted noise worse than the earlier stack ($q)"
+    B=$B "$PY" - "$OL" "$SL" "$OLDF/$SIDE.tbc.json" "$STKO.tbc.json" <<'E' || qc="predicted noise worse than the earlier stack ($q)"
 import os, sys; sys.path.insert(0, os.environ['B'])
-from stack_quality import predicted
-o, n = predicted(sys.argv[1])[0], predicted(sys.argv[2])[0]
+from stack_quality import predicted, level_range
+j = sys.argv[3:5] if level_range(sys.argv[3]) and level_range(sys.argv[4]) else [None, None]
+o, n = predicted(sys.argv[1], j[0])[0], predicted(sys.argv[2], j[1])[0]
 sys.exit(0 if n <= o * 1.05 else 1)
 E
+  elif [ ${#ins[@]} -gt 1 ]; then
+    log "stack QC: no earlier stack log${OLDF:+ ($OLDF/${SIDE}_stack_redo.log / _stack.log)} - predicted-noise check SKIPPED"
+  else
+    log "stack QC: single capture - predicted-noise check skipped"
   fi
   log "stack QC: $NFR frames (earlier $ON): $qc"
   [ "$qc" = ok ] || sethold "stack QC: $qc ($STKO.tbc)"
-  touch "$SCR/stackqc.ok"
+  stamp "$SCR/stackqc.ok"
 fi
 
 # ---- audio, dropout-correct --------------------------------------------------------------
 APCM=$OUT/${SIDE}_xm4_squelched.pcm
 [ -s "$APCM" ] || "$PY" "$LD/scripts/squelch_pcm.py" "$STKO.pcm" "$APCM" > "$OUT/${SIDE}_xm4_squelch.log" 2>&1
 [ -s "$APCM" ] || APCM=$STKO.pcm
-if [ "$(stat -c %s "$SCR/doc.tbc" 2>/dev/null)" = "$(stat -c %s "$STKO.tbc")" ] && grep -q "Total concealments" "$SCR/doc.log" 2>/dev/null; then
+MKV=$OUT/$SIDE.v8.mkv MKVOK=0
+stamped "$MKV" "$MKV.stackid" && grep -q '\[newdecode\] done' "$OUT/${SIDE}_v8_decode.log" 2>/dev/null \
+  && [ "$(nframes "$MKV")" = "$NFR" ] && MKVOK=1
+if [ "$(stat -c %s "$SCR/doc.tbc" 2>/dev/null)" = "$(stat -c %s "$STKO.tbc")" ] && grep -q "Total concealments" "$SCR/doc.log" 2>/dev/null \
+    && stamped "$SCR/doc.tbc" "$SCR/doc.tbc.stackid"; then
   log "dropout-corrected stack already in scratch, reusing"
-elif [ "$(nframes "$OUT/$SIDE.v8.mkv")" != "$NFR" ]; then
+  [ -s "$SCR/doc.tbc.stackid" ] || stamp "$SCR/doc.tbc.stackid"
+elif [ $MKVOK = 0 ]; then
   log "dropout-correct"
+  rm -f "$SCR/doc.tbc.stackid"
   ld-dropout-correct --input-json "$STKO.tbc.json" --output-json "$SCR/doc.tbc.json" \
       "$STKO.tbc" "$SCR/doc.tbc" > "$SCR/doc.log" 2>&1 || die "dropout-correct failed"
+  stamp "$SCR/doc.tbc.stackid"
   log "$(grep -i 'Total concealments' "$SCR/doc.log" | tail -1)"
 fi
 if [ -e "$V7/AUTODELETE" ] && [ ${#ins[@]} -gt 1 ]; then
@@ -124,14 +156,17 @@ if [ -e "$V7/AUTODELETE" ] && [ ${#ins[@]} -gt 1 ]; then
 fi
 
 # ---- model-based decode (GPU) ----------------------------------------------------------------
-MKV=$OUT/$SIDE.v8.mkv
-if [ "$(nframes "$MKV")" = "$NFR" ] && grep -q '\[newdecode\] done' "$OUT/${SIDE}_v8_decode.log" 2>/dev/null; then
+if [ $MKVOK = 1 ]; then
   log "$SIDE.v8.mkv already complete, reusing"
+  [ -s "$MKV.stackid" ] || stamp "$MKV.stackid"
 else
+  [ -e "$MKV" ] && log "$SIDE.v8.mkv is not from this stack or incomplete - decoding again"
   acquire gpu "${V7_GPUS:-2}"
   log "chunked newdecode (--dropout_mask 1, master yuv422p10le) -> $MKV"
+  rm -f "$MKV.stackid"
   ND_MASTER=p10 ND_CD=$ND ND_EXTRA="--dropout_mask 1" "$B/nd_chunked.sh" "$SIDE" "$SCR" "$APCM" v8 \
     || die "chunked newdecode failed"
+  stamp "$MKV.stackid"
   release
 fi
 "$PY" - "$OUT/${SIDE}_v8_satratio.txt" <<'E' | while read -r l; do log "decode QC: $l"; done
@@ -145,64 +180,101 @@ E
 log "decode: $(grep '\[newdecode\] done: chunked' "$OUT/${SIDE}_v8_decode.log" | cut -c1-300)"
 
 # ---- PVF --------------------------------------------------------------------------------------
-F=${TMPDIR:-/tmp}/${SIDE}_v8_weave.y4m PL=$OUT/${SIDE}_v8_pvf.log d=$SLOT crf=17
+F=${TMPDIR:-/tmp}/${SIDE}_v8_weave.y4m PL=$OUT/${SIDE}_v8_pvf.log d=$SLOT crf= OLDPVF=video.pvf.pre-v8 PVFID=$OUT/${SIDE}_v8_pvf.stackid
+PVFMAX=${V7_PVF_MAX:-4000000000}       # bytes (FAT32 / 32-bit PVF offsets)
 build_pvf(){ # <crf>
+  # stillweave, make_pvfv2 and verify_pvf all check the frame count against the stack's
+  # ($NFR = the master's), and stillweave's own exit status counts: a reader that died early used to
+  # give a short but valid-looking PVF.
   rm -f "$F" "$d/.video.pvf.tmp"; mkfifo "$F" || die "cannot create FIFO $F"
-  "$PY" "$ND/stillweave.py" "$MKV" --log "$OUT/${SIDE}_v8_weave.log" > "$F" 2>> "$PL" &
-  local wp=$!
+  "$PY" "$ND/stillweave.py" "$MKV" --expect-frames "$NFR" --log "$OUT/${SIDE}_v8_weave.log" > "$F" 2>> "$PL" &
+  local wp=$! rc
   echo "=== make_pvfv2 --crf $1 ===" >> "$PL"
   nice -n 10 "$PY" "$PVT/make_pvfv2.py" "$F" "$d/.video.pvf.tmp" --dedupe --crf "$1" --probe-from "$MKV" \
-      --tbc-json "$STKO.tbc.json" --audio-input "$APCM" --audio-input-rate 44100 \
+      --tbc-json "$STKO.tbc.json" --audio-input "$APCM" --audio-input-rate 44100 --expect-frames "$NFR" \
       --vf "scale=832:576:flags=lanczos" >> "$PL" 2>&1 \
-   && nice -n 10 "$PY" "$PVT/verify_pvf.py" "$d/.video.pvf.tmp" >> "$PL" 2>&1
-  local rc=$?; [ $rc = 0 ] || kill $wp 2>/dev/null
-  wait $wp; rm -f "$F"; return $rc
+   && nice -n 10 "$PY" "$PVT/verify_pvf.py" "$d/.video.pvf.tmp" --expect-frames "$NFR" >> "$PL" 2>&1
+  rc=$?; [ $rc = 0 ] || kill $wp 2>/dev/null
+  if ! wait $wp && [ $rc = 0 ]; then echo "stillweave failed - PVF rejected" >> "$PL"; rc=1; fi
+  rm -f "$F"; return $rc
 }
-if grep -q "PVF v8 OK" <(grep "AIV $SIDE " "$LOG"); then
+# the slot's video.pvf is one this v8 chain installed (replaced in place on a rebuild) or an older one
+# (kept as $OLDPVF, which must not exist yet)
+V8CUR=0; { grep -q "PVF v8 OK" <(grep "AIV $SIDE " "$LOG") || [ -s "$PVFID" ]; } && V8CUR=1
+if grep -q "PVF v8 OK" <(grep "AIV $SIDE " "$LOG") && stamped "$d/video.pvf" "$PVFID"; then
   log "PVF already installed"
+  [ -s "$PVFID" ] || stamp "$PVFID"
 else
+  [ $V8CUR = 1 ] && log "installed v8 PVF is not from this stack - rebuilding it (replaced in place, $OLDPVF untouched)"
+  # checked before the hours-long build, not after it
+  for n in $(echo "$SLOTS" | tr ',' ' '); do
+    e=$V7_SLOTROOT/BeebVFS$n
+    [ $V8CUR = 0 ] && [ -e "$e/video.pvf" ] && [ -e "$e/$OLDPVF" ] && die "$e/$OLDPVF already exists - not overwriting (no PVF built)"
+  done
   acquire pvf 1; mkdir -p "$d"
-  log "PVF v8 (still-weave, CRF 17, dedupe) -> $d"
-  if build_pvf 17 && [ "$(stat -c%s "$d/.video.pvf.tmp")" -lt 4000000000 ]; then :
-  else
-    log "CRF 17 PVF failed or >= 4 GB ($(stat -c%s "$d/.video.pvf.tmp" 2>/dev/null) bytes) - rebuilding at CRF 18"
-    crf=18; build_pvf 18 || { rm -f "$d/.video.pvf.tmp"; die "PVF v8 failed (see $PL)"; }
-  fi
+  # CRF 17, stepping up (18, 19, 20) while the PVF is >= 4 GB (FAT32 / PVF offsets)
+  for c in 17 18 19 20; do
+    log "PVF v8 (still-weave, CRF $c, dedupe) -> $d"
+    if build_pvf $c; then
+      sz=$(stat -c%s "$d/.video.pvf.tmp")
+      [ "$sz" -lt "$PVFMAX" ] && { crf=$c; break; }
+      log "CRF $c PVF is $sz bytes (>= $PVFMAX)"
+    elif awk '/^=== make_pvfv2/ {s = ""} {s = s $0 "\n"} END {printf "%s", s}' "$PL" | grep -q 'exceeds 4GB'; then
+      log "CRF $c PVF exceeds the 4 GB PVF limit"
+    elif [ $c = 17 ]; then
+      log "CRF 17 PVF failed (see $PL) - trying CRF 18"
+    else
+      rm -f "$d/.video.pvf.tmp"; die "PVF v8 failed at CRF $c (see $PL)"
+    fi
+  done
+  [ -n "$crf" ] || { rm -f "$d/.video.pvf.tmp"; die "PVF v8 still >= $PVFMAX bytes at CRF 20 (see $PL)"; }
   release
-  OLDPVF=video.pvf.pre-v8
-  if [ -e "$d/video.pvf" ]; then
+  if [ -e "$d/video.pvf" ] && [ $V8CUR = 0 ]; then
     [ -e "$d/$OLDPVF" ] && die "$d/$OLDPVF already exists - not overwriting (new PVF left at .video.pvf.tmp)"
     mv -f "$d/video.pvf" "$d/$OLDPVF"
   fi
-  mv -f "$d/.video.pvf.tmp" "$d/video.pvf"
-  log "PVF v8 OK (CRF $crf) $(stat -c%s "$d/video.pvf") bytes; $(grep '^dedupe: .*share' "$PL" | tail -1); previous kept as $OLDPVF"
+  mv -f "$d/.video.pvf.tmp" "$d/video.pvf"; stamp "$PVFID"
+  log "PVF v8 OK (CRF $crf) $(stat -c%s "$d/video.pvf") bytes; $(grep '^dedupe: .*share' "$PL" | tail -1); $([ $V8CUR = 1 ] && echo "replaced the earlier v8 PVF ($OLDPVF untouched)" || echo "previous kept as $OLDPVF")"
   for n in $(echo "$SLOTS" | tr ',' ' ' | cut -d' ' -f2-); do          # further slots get a copy
     [ "$n" = "${SLOTS%%,*}" ] && continue
     e=$V7_SLOTROOT/BeebVFS$n; mkdir -p "$e"
     cp "$d/video.pvf" "$e/.video.pvf.tmp" && cmp -s "$d/video.pvf" "$e/.video.pvf.tmp" || die "copy to $e failed"
-    o=video.pvf.pre-v8
-    if [ -e "$e/video.pvf" ]; then [ -e "$e/$o" ] && die "$e/$o exists"; mv -f "$e/video.pvf" "$e/$o"; fi
-    mv -f "$e/.video.pvf.tmp" "$e/video.pvf"; log "PVF copied to $(basename "$e") (previous kept as $o)"
+    o=$OLDPVF
+    if [ -e "$e/video.pvf" ] && [ $V8CUR = 0 ]; then [ -e "$e/$o" ] && die "$e/$o exists"; mv -f "$e/video.pvf" "$e/$o"; fi
+    mv -f "$e/.video.pvf.tmp" "$e/video.pvf"; log "PVF copied to $(basename "$e") ($([ $V8CUR = 1 ] && echo "replaced the earlier v8 copy" || echo "previous kept as $o"))"
   done
 fi
-rm -rf "$SCR/doc.tbc" "$SCR/doc.tbc.json" "$SCR/ndc"
+rm -rf "$SCR/doc.tbc" "$SCR/doc.tbc.json" "$SCR/doc.tbc.stackid" "$SCR/ndc"
 
 # ---- per-frame quality record (quality/quality_db.py).  Holds no slot; read-only on the stack, master and PVF.
+# "done" only when the core steps (run, fields, PVF) worked; otherwise the failed steps are
+# logged and the record is retried on the next run of this side.
 FQ=$DAR/quality QL=$OUT/${SIDE}_v8_quality.log
-if ! grep -q "quality record done" <(grep "AIV $SIDE " "$LOG"); then
+if ! { grep -q "quality record done" <(grep "AIV $SIDE " "$LOG") && stamped "$QL" "$QL.stackid"; }; then
   log "quality record: stack frames, blank-line noise + VITS, newdecode, PVF encode loss"
+  qf= qn= RUN=
+  [ -n "$crf" ] || crf=$(grep -o "AIV $SIDE PVF v8 OK (CRF [0-9]*" "$LOG" | tail -1 | grep -o '[0-9]*$')
   {
     RUN=$("$PY" $FQ/quality_db.py run "$SIDE" v8 "ld=$(git -C "$LD" log --oneline -1 | cut -c1-8)" \
           "ld_opts=$LD_OPTS" "stacker=$(md5sum "$STK" | cut -c1-8)" "nd=$(md5sum "$ND/newdecode.py" | cut -c1-8)" \
-          master=yuv422p10le "captures=${#ins[@]}" "pvf_crf=$crf")
-    [ -s "$OUT/${SIDE}_stack_frames.tsv" ] && "$PY" $FQ/quality_db.py stack "$RUN" "$OUT/${SIDE}_stack_frames.tsv"
-    nice -n 10 "$PY" $FQ/fq_side.py "$STKO.tbc" "$OUT/${SIDE}_v8_fields.csv" --vits \
-      && "$PY" $FQ/quality_db.py fields "$RUN" "$OUT/${SIDE}_v8_fields.csv"
-    "$PY" $FQ/quality_db.py nd "$RUN" "$OUT/${SIDE}_v8_satratio.txt" "$OUT/${SIDE}_v8_classes.txt"
-    nice -n 10 $FQ/pvf_quality.sh "$SLOT/video.pvf" "$MKV" "$OUT/${SIDE}_v8_pvfq" "$PL" \
-      && "$PY" $FQ/quality_db.py pvf "$RUN" "$OUT/${SIDE}_v8_pvfq"
-    "$PY" $FQ/quality_db.py summary "$RUN"
+          master=yuv422p10le "captures=${#ins[@]}" "pvf_crf=$crf") && [ -n "$RUN" ] || qf="$qf run"
+    if [ -n "$RUN" ]; then
+      if [ -s "$OUT/${SIDE}_stack_frames.tsv" ]; then
+        "$PY" $FQ/quality_db.py stack "$RUN" "$OUT/${SIDE}_stack_frames.tsv" || qn="$qn stack"
+      fi
+      { nice -n 10 "$PY" $FQ/fq_side.py "$STKO.tbc" "$OUT/${SIDE}_v8_fields.csv" --vits \
+        && "$PY" $FQ/quality_db.py fields "$RUN" "$OUT/${SIDE}_v8_fields.csv"; } || qf="$qf fields"
+      "$PY" $FQ/quality_db.py nd "$RUN" "$OUT/${SIDE}_v8_satratio.txt" "$OUT/${SIDE}_v8_classes.txt" || qn="$qn nd"
+      { nice -n 10 $FQ/pvf_quality.sh "$SLOT/video.pvf" "$MKV" "$OUT/${SIDE}_v8_pvfq" "$PL" \
+        && "$PY" $FQ/quality_db.py pvf "$RUN" "$OUT/${SIDE}_v8_pvfq"; } || qf="$qf pvf"
+      "$PY" $FQ/quality_db.py summary "$RUN" || qn="$qn summary"
+    fi
   } > "$QL" 2>&1
-  log "quality record done: $(tail -1 "$QL" | cut -c1-400)"
+  if [ -z "$qf" ]; then
+    stamp "$QL.stackid"
+    log "quality record done${qn:+ (non-core steps failed:$qn)}: $(tail -1 "$QL" | cut -c1-400)"
+  else
+    log "quality record FAILED (steps:$qf${qn:+; also$qn}; see $QL) - retried on the next run of this side"
+  fi
 fi
 log "=== v8 done: $MKV + $(basename "$SLOT")/video.pvf ==="

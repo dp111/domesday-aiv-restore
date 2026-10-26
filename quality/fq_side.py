@@ -8,12 +8,14 @@ One sequential read of the TBC.  Per field:
                      200-1050), per band 0-2 / 2-3.5 / 3.5-5.5 / 5.5-8.9 MHz, 16-bit units^2; plus bl_rms total
   do_samples         samples still flagged as dropout in the json (left for dropout-correct / the decoder)
   wSNR, bPSNR        (--vits) ld-process-vits white-flag SNR and black-level PSNR (run on a copy of the
-                     json, the original is not touched)
+                     json, the original is not touched).  2026-10-26: the installed ld-process-vits does not
+                     write vitsMetrics into its json, so the values come from its -d debug lines ("Field #N
+                     has wSNR of X (..) and bPSNR of Y (..)", N 1-based); 0 = not measured -> empty (NULL).
 Content-independent (blank / test lines only), so frames and versions compare directly.  Caveat: the
 cross-master blend works on the active picture only, so blank / VITS lines show the primary-master stack;
 the benchmark (make_bench.py / score.py) measures the picture itself.
 """
-import sys, os, json, csv, subprocess, tempfile
+import sys, os, re, json, csv, subprocess, tempfile
 import numpy as np
 
 sys.path.insert(0, os.environ.get('LD', os.path.expanduser('~/ld-decode')))
@@ -37,11 +39,17 @@ def main():
     vits = {}
     if '--vits' in sys.argv:
         with tempfile.TemporaryDirectory(dir=os.path.dirname(out) or '.') as td:
-            oj = f'{td}/v.json'
-            subprocess.run(['nice', '-n', '10', 'ld-process-vits', '-q', '-n', '-t', '4', '--input-json', tbc + '.json',
-                            '--output-json', oj, tbc], check=True)
-            for k, fj in enumerate(json.load(open(oj))['fields']):
-                vits[k] = fj.get('vitsMetrics') or {}
+            p = subprocess.run(['nice', '-n', '10', 'ld-process-vits', '-d', '-n', '-t', '4', '--input-json', tbc + '.json',
+                                '--output-json', f'{td}/v.json', tbc], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               text=True, errors='replace')
+        if p.returncode:
+            sys.exit(f'ld-process-vits failed ({p.returncode}): {p.stderr[-500:]}')
+        for m in re.finditer(r'Field #(\d+) has wSNR of ([-\d.e+]+) \(.*?\) and bPSNR of ([-\d.e+]+)', p.stderr):
+            w, b = float(m[2]), float(m[3])
+            vits[int(m[1]) - 1] = {'wSNR': w or None, 'bPSNR': b or None}
+        if not vits:
+            sys.exit('ld-process-vits gave no per-field metrics (debug output changed?)')
+        print(f'VITS: {len(vits)} fields measured, wSNR on {sum(v["wSNR"] is not None for v in vits.values())}', flush=True)
     rows = []
     B = 64
     for k0 in range(0, nf, B):

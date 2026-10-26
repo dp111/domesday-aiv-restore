@@ -14,7 +14,10 @@ version; re-importing a source for a run replaces that source's rows, so it is s
   quality_db.py summary [run ...]                        one line per run (all runs if none given)
 
 Tables: runs, stack_frames, fields, nd_frames, pvf_frames; view frame_quality joins them per frame
-(fields averaged over the frame's two fields).  Frame = output frame index of the stack = master frame.
+(fields averaged over the frame's two fields).  Frame = output frame index of the stack = master frame
+(fields 2n, 2n+1 = frame n, as newdecode pairs them).  2026-10-26: the view lists every frame any table
+has (it used to start from fields, so a run whose field import failed had no rows at all), and every
+connection waits up to 2 minutes for a lock (several sides write at once).
 """
 import csv
 import os
@@ -40,22 +43,27 @@ CREATE TABLE IF NOT EXISTS pvf_frames(run INTEGER, frame INTEGER, psnr_y REAL, p
     psnr_avg REAL, ssim_y REAL, ssim_all REAL, PRIMARY KEY(run, frame));
 DROP VIEW IF EXISTS frame_quality;
 CREATE VIEW frame_quality AS
-  SELECT r.run, r.side, r.label, f.frame, COALESCE(s.picture, f.picture) picture, s.avail, s.used, s.used_alt,
+  WITH fr AS (SELECT run, frame FROM stack_frames UNION SELECT run, frame FROM fields
+              UNION SELECT run, frame FROM nd_frames UNION SELECT run, frame FROM pvf_frames),
+       f AS (SELECT run, frame, MIN(picture) picture, AVG(bl_rms) bl_rms, AVG(bl_0_2) bl_0_2, AVG(bl_2_35) bl_2_35,
+                    AVG(bl_35_55) bl_35_55, AVG(bl_55_89) bl_55_89, AVG(wsnr) wsnr, AVG(bpsnr) bpsnr,
+                    SUM(do_samples) do_samples
+             FROM fields GROUP BY run, frame)
+  SELECT r.run, r.side, r.label, fr.frame, COALESCE(s.picture, f.picture) picture, s.avail, s.used, s.used_alt,
          s.filled, s.repaired, s.resid_do, f.bl_rms, f.bl_0_2, f.bl_2_35, f.bl_35_55, f.bl_55_89, f.wsnr,
          f.bpsnr, f.do_samples, n.class, n.satratio, n.sat_fallback, p.psnr_y AS pvf_psnr_y,
          p.ssim_y AS pvf_ssim_y
-  FROM (SELECT run, frame, MIN(picture) picture, AVG(bl_rms) bl_rms, AVG(bl_0_2) bl_0_2, AVG(bl_2_35) bl_2_35,
-               AVG(bl_35_55) bl_35_55, AVG(bl_55_89) bl_55_89, AVG(wsnr) wsnr, AVG(bpsnr) bpsnr,
-               SUM(do_samples) do_samples
-        FROM fields GROUP BY run, frame) f JOIN runs r USING(run)
-  LEFT JOIN stack_frames s USING(run, frame)
-  LEFT JOIN nd_frames n USING(run, frame)
-  LEFT JOIN pvf_frames p USING(run, frame);
+  FROM fr JOIN runs r ON r.run = fr.run
+  LEFT JOIN f ON f.run = fr.run AND f.frame = fr.frame
+  LEFT JOIN stack_frames s ON s.run = fr.run AND s.frame = fr.frame
+  LEFT JOIN nd_frames n ON n.run = fr.run AND n.frame = fr.frame
+  LEFT JOIN pvf_frames p ON p.run = fr.run AND p.frame = fr.frame;
 """
 
 
 def db():
-    c = sqlite3.connect(DB)
+    c = sqlite3.connect(DB, timeout=120)
+    c.execute('PRAGMA busy_timeout = 120000')
     c.executescript(SCHEMA)
     return c
 

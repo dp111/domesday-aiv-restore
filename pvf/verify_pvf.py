@@ -8,6 +8,7 @@ decode standalone (via ffmpeg), and that the audio duration matches the
 video. Run this before copying a multi-gigabyte file to the SD card.
 
 usage: verify_pvf.py video.pvf [--decode-every N]  (0 = only 3 samples)
+                     [--expect-frames N]  (fail unless the PVF has N frames)
 """
 
 import argparse
@@ -45,6 +46,9 @@ def main():
     ap.add_argument("--decode-every", type=int, default=0,
                     help="ffmpeg-decode every Nth record (slow); default: "
                          "first/middle/last only")
+    ap.add_argument("--expect-frames", type=int, default=None,
+                    help="fail unless the header's frame count is exactly N "
+                         "(e.g. the master's), so a truncated build is caught")
     args = ap.parse_args()
 
     f = open(args.pvf, "rb")
@@ -55,6 +59,8 @@ def main():
         sys.exit("bad magic/version - not a PVF1 file")
     if fc == 0:
         sys.exit("FAIL: zero frames")
+    if args.expect_frames is not None and fc != args.expect_frames:
+        sys.exit(f"FAIL: {fc} frames, expected {args.expect_frames}")
     print(f"{w}x{h} @ {fn}/{fd} fps, {fc} frames, "
           f"audio {ar} Hz x{ac} ({abpf} B/frame), max AU {maxv} B")
     if w % 32 or h % 16:
