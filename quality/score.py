@@ -14,6 +14,8 @@ Two levels, both full-reference (the truth is exact, so nothing here is an estim
       snr_y_<band>                 luma signal-to-error ratio per horizontal band (dB), 0-1 ... 4-5 MHz
       gain_y_<band>                detail retention: Re<O,T>/<T,T> per band (1 = kept; < 1 = softened)
       snr_c_<band>, gain_c_<band>  the same for chroma (Cb+Cr), 0-0.5, 0.5-1, 1-1.5 MHz
+      noise_y8 / noise_c8          output noise (8-bit rms): the error minus its Gaussian blur (sigma 2 px), over
+                                   the pixels where the truth is locally flat (7x7 luma std < 1.5 levels); 2026-10-26
   The sub-pixel shift between output and truth is measured per field / frame and removed before scoring; it
   is reported (dx), and its spread over the run as jitter_dx_*.
 
@@ -22,7 +24,7 @@ Writes <seg>/<label>/score_frames.csv and score_fields.csv, and <benchdir>/<labe
 """
 import sys, os, json, csv
 import numpy as np
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, uniform_filter
 
 sys.path.insert(0, os.environ.get('LD', os.path.expanduser('~/ld-decode')))
 from lddecode.stack import cav_picture, field_vbi
@@ -150,6 +152,14 @@ def score_picture(d, o, start):
             r[f'psnr_{nm}'] = round(10 * np.log10(PEAK ** 2 / max(mse[c], 1e-9)), 2)
         r['rmse_y8'] = round(float(np.sqrt(mse[0])) / 256, 3)
         r['ssim_y'] = round(ssim(t[0], o_[0]), 4)
+        mu = uniform_filter(t[0], 7); flat = (uniform_filter(t[0] ** 2, 7) - mu ** 2) < 384.0 ** 2
+        flat[:4] = flat[-4:] = False; flat[:, :4] = flat[:, -4:] = False
+        if flat.sum() > 2000:
+            hp = [e[c] - gaussian_filter(e[c], 2) for c in range(3)]
+            r['noise_y8'] = round(float(np.sqrt((hp[0][flat] ** 2).mean())) / 256, 3)
+            r['noise_c8'] = round(float(np.sqrt(((hp[1][flat] ** 2).mean() + (hp[2][flat] ** 2).mean()) / 2)) / 256, 3)
+        else:
+            r['noise_y8'] = r['noise_c8'] = float('nan')
         # gain / SNR only where the truth has content in the band (a near-black frame makes them noise / ~0);
         # err (rms of the error in the band, 16-bit units) is content-independent and always reported
         for nm, T_, O_, bands in (('y', t[0], o_[0], YB),

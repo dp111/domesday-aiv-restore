@@ -9,8 +9,12 @@ is stable (pole at (1-c)a/(1-ca) < 1).  Applied along each TBC line.
 c=0.16, tau=9 were tuned to flatten the bar and sync edges (deviation after
 the edge 2.4-3.9% -> 1.0-1.4%); the single-exponential fit underestimates them.
 """
+import os
 import numpy as np
 from scipy.signal import lfilter
+
+# PALDEC_DEGHOST=0: skip the inverse (v6, 2026-10-26; A/B of the channel model on the fq benchmark)
+ENABLED = os.environ.get('PALDEC_DEGHOST', '1') != '0'
 
 
 def deghost(lines, c=0.16, tau=9.0):
@@ -22,3 +26,8 @@ def deghost(lines, c=0.16, tau=9.0):
     flat = x.reshape(-1)
     y = lfilter(b, den, flat - flat[0]) + flat[0]
     return y.reshape(x.shape)
+
+
+def channel_inverse(field):
+    """deghost() unless PALDEC_DEGHOST=0 (then the field as float64)"""
+    return deghost(field) if ENABLED else np.asarray(field, dtype=np.float64)

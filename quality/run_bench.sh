@@ -9,6 +9,8 @@
 #   ND_EXTRA   newdecode options           (default "--dropout_mask 1", production)
 #   STEPS      subset of "stack doc nd"    (default all three)
 #   NOGPU=1    stop after doc (no newdecode)
+#   ND_WRAP    newdecode wrapper (default pipeline/nd_gpuwrap.py; bench runs use a renamed copy, since the
+#              production gpugate pauses stacks while any nd_gpuwrap.py runs)
 #   DOC_FROM   decode another label's doc.tbc (e.g. DOC_FROM=prod STEPS=nd), or DOC_FROM=clean for the
 #              noise-free composite (the decoder's own ceiling)
 # caps: capture names to use (default all synthetic captures), e.g. "ds1 ds2 ds4" for a reduced stack, or a
@@ -53,7 +55,7 @@ for d in $(ls -d "$B"/seg${SEGS:-*}/ "$B"/pat${SEGS:-*}/ 2>/dev/null); do   # SE
         || { echo "$d: ld-chroma-decoder failed"; continue; }
       echo "$d: done"; continue
     fi
-    "$MLPY" "$DAR/pipeline/nd_gpuwrap.py" "$ND_CD/newdecode.py" "$o/doc.tbc" - --scratch "$o/nd" --video 1 $ND_EXTRA 2> "$o/nd.log" \
+    "$MLPY" "${ND_WRAP:-$DAR/pipeline/nd_gpuwrap.py}" "$ND_CD/newdecode.py" "$o/doc.tbc" - --scratch "$o/nd" --video 1 $ND_EXTRA 2> "$o/nd.log" \
       | ffmpeg -hide_banner -loglevel error -y -i - -f rawvideo -pix_fmt yuv444p16le "$o/out.yuv" \
       || { echo "$d: newdecode failed"; continue; }
     rm -rf "$o/nd"

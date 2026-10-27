@@ -45,6 +45,10 @@ os.makedirs(a.scratch, exist_ok=True)
 S = lambda n: os.path.join(a.scratch, n)
 log = lambda *x: print('[vidsplice]', *x, file=sys.stderr, flush=True)
 nfr = a.frames or os.path.getsize(a.tbc) // (2 * FSZ)
+# v6: luma levels from this TBC's declared black/white, as newdecode (v5 used model_params.json's fixed AY/B)
+_lv = M.set_levels(json.load(open(a.tbc + '.json'))['videoParameters'])
+if _lv:
+    log('levels from TBC: black16bIre %.0f white16bIre %.0f -> AY %.6f B %.2f' % (_lv + (M.P['AY'], M.P['B'])))
 
 
 def _score(b):
@@ -86,12 +90,12 @@ mini_fr = np.concatenate([np.arange(s, e + 1) for s, e in segs])          # mini
 pos = {int(f): k for k, f in enumerate(mini_fr)}
 
 # ---- prep --------------------------------------------------------------------
-from deghost import deghost
+from deghost import channel_inverse
 from deherring import deherring_field
 _fd = os.open(a.tbc, os.O_RDONLY)
 def _prep(f):
     x = np.frombuffer(os.pread(_fd, 2 * FSZ, int(f) * 2 * FSZ), '<u2').reshape(2, M.H, M.W).astype(np.float64)
-    y = np.array([deherring_field(deghost(g))[0] for g in x])
+    y = np.array([deherring_field(channel_inverse(g))[0] for g in x])
     return np.clip(np.round(y), 0, 65535).astype('<u2').tobytes()
 
 mini = S('mini.tbc')
@@ -136,11 +140,17 @@ if not os.path.exists(S('solve.done')):
     inter = cand[s2 > THRESH]
     log(f'{len(inter)} interlaced frames (t2d score > {THRESH})' + (f'; newdecode reported {a.expect}' if a.expect else ''))
     np.save(S('inter.npy'), inter)
+    from noisepsd import noise_psd, noise_psd_active, combine
+    # v6: noise spectrum as newdecode (PALDEC_NOISE=active: active picture after the deghost inverse, guarded by
+    # the blank-line estimate; vbi = v5); measured before torch (the estimator forks)
+    if os.environ.get('PALDEC_NOISE', 'active') == 'vbi':
+        _psd = noise_psd(a.tbc, nfields=200)
+    else:
+        _psd = combine(noise_psd_active(a.tbc), noise_psd(a.tbc, nfields=200, inverse=True))[0]
     import torch, optcore as O
-    from noisepsd import noise_psd
     # 2026-10-14 combined candidate: weights / priors / Hanover / luma roll-off from
     # optcore.decoder_config (env PALDEC_NW, PALDEC_PRIORS, PALDEC_HANOVER, PALDEC_LUMA_LPF)
-    CFG = O.decoder_config(noise_psd(a.tbc, nfields=200))
+    CFG = O.decoder_config(_psd)
     NOISE_W = CFG['noise_w']
     VP = dict(VPARAMS); VP.update(CFG['video']); LUMA_LPF = CFG['luma_lpf']
     log(f"config: k {CFG['k']:.3f} video {CFG['video']} hanover {CFG['hanover_video']:.2f} luma_lpf {LUMA_LPF}")

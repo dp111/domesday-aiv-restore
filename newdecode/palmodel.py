@@ -52,6 +52,17 @@ import json as _json, os as _os
 P = _json.load(open(_os.environ.get("PALDEC_PARAMS") or _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "model_params.json")))
 
 
+def set_levels(vp):
+    """Luma levels from a TBC's declared black/white (newdecode 2026-10-24; shared with vidsplice since v6):
+    composite = AY*Y + B maps Y 4096 (8-bit 16) to black16bIre and Y 60160 (235) to white16bIre.
+    PALDEC_LEVELS=params keeps the json's AY/B.  -> (black, white) or None"""
+    if _os.environ.get('PALDEC_LEVELS', 'tbc') == 'params':
+        return None
+    bk, wh = float(vp['black16bIre']), float(vp['white16bIre'])
+    P['AY'] = (wh - bk) / (60160 - 4096); P['B'] = bk - P['AY'] * 4096
+    return bk, wh
+
+
 def carriers(beta0, par, nlines=H, width=W, x0=0, line0=0):
     """Per-line carriers (nlines, width) multiplying U and V.
 

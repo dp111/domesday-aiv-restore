@@ -4,7 +4,13 @@ For each segment of real decoded frames (the "truth", any content will do: it is
 definition), encode a clean PAL composite TBC with ld-chroma-encoder, then make one synthetic capture per
 real capture of the side:
 
-  capture c of master m = subsample_shift(clean + shared_m, dx_c) + indep_c, + real dropouts
+  capture c of master m = subsample_shift(H(clean) + shared_m, dx_c) + indep_c, + real dropouts
+
+  H          the disc channel's slow edge smear (paldec deghost.py model, c=0.16 tau=9 samples, FQ_SMEAR=c,tau;
+             0 = off): every real TBC carries it and newdecode always applies its inverse G, so a bench
+             without it is too sharp (2026-10-26: luma gain 1-2 MHz 1.16 on the noise-free decode = 1/|H|).
+             clean.tbc holds H(clean), the signal the stack should recover.  The noise is added after H (the
+             measured spectra are of real TBCs, i.e. already through the channel).
 
   shared_m   one Gaussian noise realisation per master and segment, with the master's measured spectrum
              (noise pressed into the glass master: identical in every capture of it)
@@ -20,9 +26,15 @@ synthetic captures exactly as it does real ones.  Noise is level-independent in 
 spectra); the model is in measure_noise.py.
 
   make_bench.py <benchdir> <noise.npz> <truth.mkv> <stack.tbc.json> <dropout-segdir-glob> <start>:<len>...
+
+FQ_FROM=<old benchdir>: rebuild an existing benchmark (same segment list and order as it was made): truth.yuv,
+VBI and every capture's dropOuts are taken from it, so with the same seed the noise realisations are
+identical and only the changed options (e.g. FQ_SMEAR) differ.  <truth.mkv> <stack.tbc.json> <glob> are then
+ignored ('-').
 """
 import sys, os, glob, json, subprocess
 import numpy as np
+from scipy.signal import lfilter
 
 W, H = 1135, 313
 FW, FH = 928, 576
@@ -69,6 +81,22 @@ def chroma_errors(rng, x):
     return np.fft.irfft(X, n=W, axis=-1)
 
 
+SMEAR = [float(v) for v in os.environ.get('FQ_SMEAR', '0.16,9').split(',')]
+
+
+def smear(fields):
+    """the channel H(z) = ((1-ca) - (1-c)a z^-1) / (1 - a z^-1), exact inverse of deghost.deghost's G, run per
+    field over its lines as one signal (as deghost is applied in newdecode)"""
+    if not SMEAR[0]:
+        return fields
+    c, tau = SMEAR; a = np.exp(-1.0 / tau)
+    out = np.empty_like(fields)
+    for k, f in enumerate(fields):
+        fl = f.reshape(-1)
+        out[k] = (lfilter([1.0 - c * a, -(1.0 - c) * a], [1.0, -a], fl - fl[0]) + fl[0]).reshape(f.shape)
+    return out
+
+
 def dropout_pool(segglob, cap):
     pool = []
     for seg in sorted(glob.glob(segglob)):
@@ -81,6 +109,7 @@ def dropout_pool(segglob, cap):
 
 def main():
     bench, npz, mkv, sjson, segglob = sys.argv[1:6]
+    old = os.environ.get('FQ_FROM')
     # <start>:<len> takes frames start.. of truth.mkv; file=<yuv>:<start>:<len> takes a ready truth .yuv
     # (928x576 yuv444p16le, e.g. test patterns from make_patterns.sh) and only borrows the VBI of frames start..
     segs = []
@@ -109,11 +138,12 @@ def main():
     mdx = [float(v) for v in os.environ.get('FQ_MASTER_DX', '0,-0.3,-1.3').split(',')]
     dx = {c: (mdx[m] if m < len(mdx) else 0.0) + (0.0 if c == masters[0][0] else float(rng.uniform(-0.02, 0.02)))
           for m, g in enumerate(masters) for c in g}
-    pools = {c: dropout_pool(segglob, c) for c in caps}
+    pools = {c: dropout_pool(segglob, c) for c in caps} if not old else None
     pos = {c: 0 for c in caps}
-    SJ = json.load(open(sjson))
+    SJ = json.load(open(sjson)) if not old else None
     os.makedirs(bench, exist_ok=True)
-    meta = {'noise_model': npz, 'truth': mkv, 'masters': str(M['masters']), 'dx': dx, 'segments': []}
+    meta = {'noise_model': npz, 'truth': mkv, 'masters': str(M['masters']), 'dx': dx, 'smear': SMEAR,
+            'from': old, 'segments': []}
     if os.path.exists(f'{bench}/bench.json'):          # adding segments to an existing benchmark
         old = json.load(open(f'{bench}/bench.json'))
         meta['segments'] = [g for g in old['segments'] if g['dir'] not in
@@ -122,7 +152,10 @@ def main():
         d = f'{bench}/{"pat" if src else "seg"}{s:05d}'
         os.makedirs(d, exist_ok=True)
         tr = f'{d}/truth.yuv'
-        if src:
+        od = f'{old}/{os.path.basename(d)}' if old else None
+        if old:
+            subprocess.run(['cp', f'{od}/truth.yuv', tr], check=True)
+        elif src:
             with open(src, 'rb') as fi, open(tr, 'wb') as fo:
                 fo.write(fi.read(L * 3 * FW * FH * 2))
         else:
@@ -131,13 +164,18 @@ def main():
         subprocess.run(['ld-chroma-encoder', '-q', '-f', 'PAL', '-p', 'yuv', tr, f'{d}/clean.tbc'], check=True)
         ej = json.load(open(f'{d}/clean.tbc.json'))
         nf = len(ej['fields'])
+        oj = json.load(open(f'{od}/clean.tbc.json')) if old else None
         for k in range(nf):                   # real VBI (CAV picture numbers) of the truth frames
-            src = SJ['fields'][2 * s + k]
-            ej['fields'][k]['vbi'] = src.get('vbi', {})
+            fsrc = oj['fields'][k] if old else SJ['fields'][2 * s + k]
+            ej['fields'][k]['vbi'] = fsrc.get('vbi', {})
             ej['fields'][k]['seqNo'] = k + 1
         json.dump(ej, open(f'{d}/clean.tbc.json', 'w'))
-        clean = np.memmap(f'{d}/clean.tbc', dtype='<u2', mode='r').reshape(nf, H, W)
+        clean = smear(np.fromfile(f'{d}/clean.tbc', dtype='<u2').reshape(nf, H, W).astype(np.float64)).astype(np.float32)
+        np.clip(np.rint(clean), 0, 65535).astype('<u2').tofile(f'{d}/clean.tbc')
         cjs = {c: json.loads(json.dumps(ej)) for c in caps}
+        if old:                               # the old bench's per-field dropout lists, in its order
+            odl = {c: [(fj.get('dropOuts') or {}) for fj in json.load(open(f'{od}/syn_{c}.tbc.json'))['fields']]
+                   for c in caps}
         outs = {c: open(f'{d}/syn_{c}.tbc', 'wb') for c in caps}
         B = 16                                # fields per block (memory: ~1 GB peak)
         for k0 in range(0, nf, B):
@@ -148,20 +186,25 @@ def main():
                 for c in g:
                     x = chroma_errors(rng, shift_lines(disc, dx[c])) + noise_fields(rng, hi[c], k1 - k0)
                     for k in range(k0, k1):
-                        dl = pools[c][pos[c] % len(pools[c])]; pos[c] += 1
+                        if old:
+                            do = odl[c][k]; dl = list(zip(do.get('fieldLine', []), do.get('startx', []), do.get('endx', [])))
+                        else:
+                            dl = pools[c][pos[c] % len(pools[c])]; pos[c] += 1
                         fl, sx, ex = [], [], []
                         for line, a, b in dl:
                             line, a, b = int(line), int(a), int(b)
-                            if not (0 <= line < H and 0 <= a < b <= W):
+                            # fieldLine is 1-based (ld-decode writes line+1; ld-dropout-correct and newdecode read
+                            # row fieldLine-1).  Before 2026-10-26 the span was written one row too low.
+                            if not (0 < line <= H and 0 <= a < b <= W):
                                 continue
-                            x[k - k0, line, a:b] = 16384 + 3000 * rng.standard_normal(b - a)
+                            x[k - k0, line - 1, a:b] = 16384 + 3000 * rng.standard_normal(b - a)
                             fl.append(line); sx.append(a); ex.append(b)
                         if fl:
                             cjs[c]['fields'][k]['dropOuts'] = {'fieldLine': fl, 'startx': sx, 'endx': ex}
                     np.clip(np.rint(x), 0, 65535).astype('<u2').tofile(outs[c])
         for c in caps:
             outs[c].close(); json.dump(cjs[c], open(f'{d}/syn_{c}.tbc.json', 'w'))
-        meta['segments'].append({'start': s, 'frames': L, 'dir': d, 'truth_src': src or mkv})
+        meta['segments'].append({'start': s, 'frames': L, 'dir': d, 'truth_src': (od or src or mkv)})
         print(f'segment {s}+{L}: {nf} fields, {len(caps)} synthetic captures', flush=True)
     json.dump(meta, open(f'{bench}/bench.json', 'w'), indent=1)
 

@@ -17,10 +17,10 @@ import argparse, json, os, shutil, subprocess, sys, time
 import numpy as np, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import optcore as O, palmodel as M
-from deghost import deghost
+from deghost import channel_inverse, ENABLED as DEGHOST_ON
 from deherring import deherring_field
 from concurrent.futures import ProcessPoolExecutor
-from noisepsd import noise_psd
+from noisepsd import noise_psd, noise_psd_active, combine as noise_combine
 
 # tuned on a bench with noise shaped to a real stack's spectrum (bench.py BENCH_PSD),
 # with the data term weighted by 1/noise power per frequency (optcore.noise_weights)
@@ -45,12 +45,10 @@ base = a.tbc[:-4]
 # to black16bIre and Y 60160 (235) to white16bIre.  Real ld-decode TBCs declare the black they measured
 # (~16060 on South, not 16384), so the fixed AY/B of model_params.json put the porch 1.9 levels below 16;
 # for the fq benchmark's TBCs (16384/54016) this gives exactly the adopted 0.671233/13634.63.
-# PALDEC_LEVELS=params keeps the json's AY/B.
-if os.environ.get('PALDEC_LEVELS', 'tbc') != 'params':
-    _vp = json.load(open(base + '.tbc.json'))['videoParameters']
-    _bk, _wh = float(_vp['black16bIre']), float(_vp['white16bIre'])
-    M.P['AY'] = (_wh - _bk) / (60160 - 4096); M.P['B'] = _bk - M.P['AY'] * 4096
-    print('levels from TBC: black16bIre %.0f white16bIre %.0f -> AY %.6f B %.2f' % (_bk, _wh, M.P['AY'], M.P['B']), file=sys.stderr, flush=True)
+# PALDEC_LEVELS=params keeps the json's AY/B.  (v6: palmodel.set_levels, shared with vidsplice)
+_lv = M.set_levels(json.load(open(base + '.tbc.json'))['videoParameters'])
+if _lv:
+    print('levels from TBC: black16bIre %.0f white16bIre %.0f -> AY %.6f B %.2f' % (_lv + (M.P['AY'], M.P['B'])), file=sys.stderr, flush=True)
 os.makedirs(a.scratch, exist_ok=True)
 fd = os.open(a.tbc, os.O_RDONLY)
 FSZ = M.H * M.W * 2
@@ -59,9 +57,26 @@ end = nfr_all if a.frames is None else min(nfr_all, a.start + a.frames)
 nfr = end - a.start
 log = lambda *x: print('[newdecode]', *x, file=sys.stderr, flush=True)
 
-# noise spectrum of THIS stack (blank VBI lines) -> data-term weights
+# noise spectrum of THIS stack -> data-term weights and prior scale k
 # ZIP_NOISE_FROM: optional other TBC for the noise spectrum (clip tests: use the full side's stack)
-CFG = O.decoder_config(noise_psd(os.environ.get('ZIP_NOISE_FROM', a.tbc), nfields=200))
+# v6 (PALDEC_NOISE=active, default): measured in the ACTIVE PICTURE after the deghost inverse (noisepsd.
+# noise_psd_active: same-phase field differences in static blocks), guarded by the blank-line estimate (also
+# after the inverse; noisepsd.combine).  The blank lines carry only the primary master (the cross-master blend works on
+# the picture), so on 3-master sides v5's estimate (PALDEC_NOISE=vbi) overstated the picture's noise and
+# with it every prior: fq benchS3 Test Card stack: true noise sigma 385-398 (flat areas), active 366, blank
+# lines 1044 (raw 888).  The guard covers clips without static content (CAV stills only).
+_nsrc = os.environ.get('ZIP_NOISE_FROM', a.tbc)
+NOISE_MODE = os.environ.get('PALDEC_NOISE', 'active')
+if NOISE_MODE == 'vbi':
+    _psd = noise_psd(_nsrc, nfields=200)
+else:
+    _ni = {}
+    _pa = noise_psd_active(_nsrc, info=_ni); _pv = noise_psd(_nsrc, nfields=200, inverse=True)
+    _psd, _qh = noise_combine(_pa, _pv)
+    print('[newdecode] noise: active sigma %.0f, blank lines %.0f, used %.0f (5.5-8 MHz power ratio %.3f)  %s'
+          % (O.noise_sigma(_pa), O.noise_sigma(_pv), O.noise_sigma(_psd), _qh, _ni), file=sys.stderr, flush=True)
+np.save(os.path.join(a.scratch, 'noise_psd.npy'), _psd)
+CFG = O.decoder_config(_psd)
 NOISE_W = CFG['noise_w']
 PARAMS.update(CFG['still']); PARAMS['hanover'] = CFG['hanover']
 FILM = dict(CFG['film'])
@@ -77,7 +92,7 @@ T0 = time.time()
 # build), so a retry after a failure reuses it; the stamp ties it to its source.
 dg = os.path.join(os.path.dirname(os.path.abspath(a.scratch)), 'dg_cache.tbc')
 _st = os.stat(a.tbc)
-STAMP = dict(src=os.path.abspath(a.tbc), size=_st.st_size, mtime=_st.st_mtime, start=a.start, end=end)
+STAMP = dict(src=os.path.abspath(a.tbc), size=_st.st_size, mtime=_st.st_mtime, start=a.start, end=end, deghost=DEGHOST_ON)
 def _stamp_ok():
     try:
         return json.load(open(dg + '.stamp')) == STAMP and os.path.getsize(dg) == nfr * 2 * FSZ
@@ -88,7 +103,7 @@ def _prep(buf_n):
     """de-smear then remove the disc's FM-beat herringbone, one chunk of fields"""
     buf, n = buf_n
     x = np.frombuffer(buf, '<u2').reshape(n * 2, M.H, M.W).astype(np.float64)
-    y = np.array([deherring_field(deghost(f))[0] for f in x])
+    y = np.array([deherring_field(channel_inverse(f))[0] for f in x])
     c = [y[2 * i, 30:298, 192:1096].reshape(67, 4, 113, 8).mean((1, 3)) for i in range(n)]
     return np.clip(np.round(y), 0, 65535).astype('<u2').tobytes(), c
 
@@ -126,7 +141,9 @@ else:
 np.save(dg + '.coarse.npy', np.array(coarse))
 os.close(fd)
 j = json.load(open(base + '.tbc.json'))
-# v5 dropout masks: field index (relative to --start) -> list of (field row, x0, x1) in solver coordinates
+# v5 dropout masks: field index (relative to --start) -> list of (field row, x0, x1, fx0, fx1) in solver
+# coordinates: x0..x1 the padded solver mask (clipped to the picture), fx0..fx1 the flagged span (v6: unclipped,
+# for doi_mask; v5 shrank the clipped padded span back, losing up to DOPAD-DOI_PAD flagged columns at the edges)
 DOPAD = int(os.environ.get('PALDEC_DOPAD', '6'))
 DO_VMIN = int(os.environ.get('PALDEC_DO_VMIN', '3'))   # shortest interlaced run whose solve gets the mask   # deghost/deherring spread a dropout edge a few samples
 DO = {}
@@ -137,13 +154,14 @@ if a.dropout_mask:
             continue
         for x0, x1, L in zip(d['startx'], d['endx'], d['fieldLine']):
             r = L - 1 - O.LINE0                     # fieldLine is 1-based (checked on Financial1)
-            x0, x1 = max(0, x0 - DOPAD - O.X0), min(OW, x1 + DOPAD - O.X0)
+            fx0, fx1 = x0 - O.X0, x1 - O.X0
+            x0, x1 = max(0, fx0 - DOPAD), min(OW, fx1 + DOPAD)
             if 0 <= r < OH // 2 and x1 > x0:
-                DO.setdefault(k, []).append((r, x0, x1))
+                DO.setdefault(k, []).append((r, x0, x1, fx0, fx1))
     log('dropout mask: %d fields with dropouts in the picture area, %d segments (pad %d)' % (len(DO), sum(map(len, DO.values())), DOPAD))
 def fmask(k):
     m = np.ones((OH // 2, OW), np.float32)
-    for r, x0, x1 in DO.get(k, ()):
+    for r, x0, x1, _, _ in DO.get(k, ()):
         m[r, x0:x1] = 0
     return m
 def dmask(idx):
@@ -162,20 +180,25 @@ def dmask(idx):
 # /mnt/s/domsday/fq/dofill (dropout luma err 8.96 -> 8.03, never worse per segment); default replace, off = plain masked solve.
 DOI = os.environ.get('PALDEC_DOI', 'replace')
 DOI_PAD = int(os.environ.get('PALDEC_DOI_PAD', '2'))
+DOI_FB_LUMA = os.environ.get('PALDEC_DOI_FB', 'solve') == 'solve'   # v6; 'interp' = v5 (interpolate it too)
 # Temporal part (2026-10-25, user: "if that part of the frame doesn't move we can use the previous and next
 # frame"): after the vertical interpolation, a dropout pixel takes the mean of the previous / next frame's
 # pixel wherever that neighbour is clean there and locally static - box (13x33) mean |dY| and |dC| over the
 # pixels clean in both frames < PALDEC_DOT levels (8-bit; 0 = off).  fq dofill: 1.5 never worse per segment.
+# v6: the threshold is noise-relative: PALDEC_DOT x sigma / DOT_REF, sigma = the stack's picture noise (16-bit, the
+# spectrum above; DOT_REF 600 = fq benchS4's typical picture noise, where 1.5 was tuned)
 DOT = float(os.environ.get('PALDEC_DOT', '1.5'))
+DOT_REF = float(os.environ.get('PALDEC_DOT_REF', '600'))
+DOT_T = DOT * O.noise_sigma(_psd) / DOT_REF if NOISE_MODE != 'vbi' and os.environ.get('PALDEC_DOT_ABS', '0') != '1' else DOT
 from scipy.ndimage import uniform_filter as _uf
 def _boxmean(v, w):
     return _uf(v * w, (13, 33), mode='constant') / np.maximum(_uf(w, (13, 33), mode='constant'), 1e-6)
 def doi_mask(i):
     m = np.zeros((OH, OW), bool)
     for p in (0, 1):
-        for r, x0, x1 in DO.get(2 * i + p, ()):
-            # DO holds the solver mask (padded by DOPAD); shrink it back to the flagged span + DOI_PAD
-            m[2 * r + p, max(0, x0 + DOPAD - DOI_PAD):min(OW, x1 - DOPAD + DOI_PAD)] = True
+        for r, _, _, fx0, fx1 in DO.get(2 * i + p, ()):
+            # the flagged span + DOI_PAD (v6: from the unclipped span)
+            m[2 * r + p, max(0, fx0 - DOI_PAD):min(OW, fx1 + DOI_PAD)] = True
     return m
 def doi_fill(x, m, offs):
     """x (3, OH, OW) float32; returns x with m's pixels linearly interpolated between the nearest unmasked rows"""
@@ -341,7 +364,7 @@ def decode_window(i0, F2, F3):
     """F2/F3: dict frame -> init (transform2d / transform3d).  Returns dict frame -> output."""
     idx = sorted(F2)
     res = {}
-    held = set()
+    held = set(); fbf = set()
     inter = {i: comb_score(F2[i][0]) > 0.58 for i in idx}   # combscore: static <=0.50
     # runs of single-instant frames linked by same-scene correlation
     runs, cur = [], []
@@ -426,7 +449,7 @@ def decode_window(i0, F2, F3):
                                 # (its chroma is what failed the guard: synthetic test luma err 9.3 -> 4.4, chroma 1.7 -> 2.0)
                                 hole = dmask([kk])[0] < 0.5
                                 x = np.concatenate([np.where(hole, x[0], F3[kk][0])[None], F3[kk][1:]])
-                                stats['fb_filled'] = stats.get('fb_filled', 0) + 1
+                                stats['fb_filled'] = stats.get('fb_filled', 0) + 1; fbf.add(kk)
                             else:
                                 x = F3[kk]
                         res[kk] = x
@@ -440,6 +463,8 @@ def decode_window(i0, F2, F3):
                 continue
             x = np.asarray(res[i], np.float32)
             y = doi_fill(x, m, [-8, -6, -4, -2, 2, 4, 6, 8] if inter[i] else [-4, -3, -2, -1, 1, 2, 3, 4])
+            if i in fbf and DOI_FB_LUMA:      # v6: a guard-fallback frame keeps the masked solve's luma in its holes
+                y[0] = x[0]
             res[i] = y if DOI == 'replace' else 0.5 * (x + y)
             stats['doi'] = stats.get('doi', 0) + 1
     if a.dropout_mask and DOT > 0:
@@ -456,7 +481,7 @@ def decode_window(i0, F2, F3):
                 w = (~m & ~mj).astype(np.float32)
                 dy = _boxmean(np.abs(x[0] - y[0]), w) / 256
                 dc = _boxmean(0.5 * (np.abs(x[1] - y[1]) + np.abs(x[2] - y[2])), w) / 256
-                st = (dy < DOT) & (dc < DOT) & m & ~mj
+                st = (dy < DOT_T) & (dc < DOT_T) & m & ~mj
                 ssum[:, st] += y[:, st]; cnt[st] += 1
             sel = cnt > 0
             if sel.any():
@@ -473,8 +498,24 @@ def decode_window(i0, F2, F3):
     return res
 
 
-for w0 in range(0, nfr, WIN):
-    w1 = min(nfr, w0 + WIN)
+# v6: window ends at a run boundary (a frame not linked to its predecessor) where possible: v5's fixed 64-frame
+# windows split held / film runs, leaving short fragments that are solved as singles or short runs
+# (South: 8 single-frame fragments).  A run crossing w0+WIN is taken whole when it ends by w0+WIN_MAX, else
+# the window ends where it starts (if that leaves >= WIN/4 frames), else it is split at w0+WIN (pieces >= 16).
+# PALDEC_WIN_MAX=64 restores v5.
+WIN_MAX = int(os.environ.get('PALDEC_WIN_MAX', 96))
+def window_end(w0):
+    e = min(nfr, w0 + WIN)
+    if e == nfr or not same[e] or WIN_MAX <= WIN:
+        return e
+    t = next((b for b in range(e + 1, min(nfr, w0 + WIN_MAX) + 1) if b == nfr or not same[b]), None)
+    if t is not None:
+        return t
+    s0 = next((b for b in range(e - 1, w0 + WIN // 4 - 1, -1) if not same[b]), None)
+    return s0 if s0 is not None else e
+w0 = 0
+while w0 < nfr:
+    w1 = window_end(w0)
     F2 = {}; F3 = {} if p3 else None
     for i in range(w0, w1):
         F2[i] = p2.frame(i)
@@ -486,6 +527,7 @@ for w0 in range(0, nfr, WIN):
             x = x.copy(); x[0] = np.fft.irfft(np.fft.rfft(x[0], axis=1) * _lp, OW, axis=1)
         out.write(b'FRAME\n'); out.write(np.clip(np.round(x), 0, 65535).astype('<u2').tobytes())
     log(f'frame {w1}/{nfr}  {stats}')
+    w0 = w1
 
 out.flush()
 os.close(_dgfd)

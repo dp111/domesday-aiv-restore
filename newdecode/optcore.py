@@ -62,16 +62,31 @@ def noise_weights(psd, floor=0.05, ceil=None):
     cap; the near-noiseless >7.5 MHz bins otherwise get weights ~7 against ~0.02
     in band, a stiff direction that leaves L-BFGS under-converged at 60 iterations."""
     w = 1.0 / np.maximum(psd, 1e-9)
-    w = w / w.mean()
+    if NW_NORM == 'inband':
+        # v6: scaled so the quietest picture band (0-5 MHz, 0.5 MHz smoothed) sits at the cap; v5 divided by the
+        # mean over all bins, which the near-noiseless bins above ~7.5 MHz (TBC low-pass) dominate, so the
+        # in-band weights fell to the floor or rose to the cap depending on how quiet that band happened to be
+        # (fq bench: all at the floor; real South clips: mostly at the cap, i.e. 4x the bench's data weight)
+        f = np.fft.rfftfreq(2 * (len(psd) - 1), 1 / FS)
+        sm = np.convolve(np.pad(psd, 13, mode='edge'), np.ones(27) / 27, 'valid')
+        w = w * float(np.min(sm[(f > 0.2) & (f < 5.0)])) * (ceil or 1.0)
+    else:
+        w = w / w.mean()
     w = np.maximum(w, floor)
     if ceil:
         w = np.minimum(w, ceil)
+    # v6: the losses sum |rfft|^2 * w * 2/N over the half spectrum, which counts the DC and Nyquist bins
+    # twice (they have no mirror bin); halve their weights (PALDEC_NW_EDGES=0: v5)
+    if NW_EDGES:
+        w = w.copy(); w[0] *= 0.5; w[-1] *= 0.5          # rows are 928 samples (even): the last bin is Nyquist
     return w.astype(np.float32)
 
 
 def noise_sigma(psd):
-    """rms noise (16-bit units) of a noise_psd() spectrum"""
-    return float(np.sqrt(np.sum(psd) * 2 / 928 ** 2))
+    """rms noise (16-bit units) of a noise_psd() spectrum (v6: DC and Nyquist bins counted once)"""
+    if not NW_EDGES:
+        return float(np.sqrt(np.sum(psd) * 2 / 928 ** 2))
+    return float(np.sqrt((2 * np.sum(psd) - psd[0] - psd[-1]) / 928 ** 2))
 
 
 # ---- decoder configuration (combined candidate, 2026-10-14) --------------------
@@ -90,6 +105,10 @@ def noise_sigma(psd):
 #   PALDEC_HCOMPILE (compile the stage-2 prior, 1).  Production behaviour:
 #   PALDEC_PARAMS=<old json> PALDEC_NW=prod PALDEC_PRIORS=prod PALDEC_HANOVER=0 PALDEC_W5=0
 NW_MODE = os.environ.get('PALDEC_NW', 'rec')
+NW_EDGES = os.environ.get('PALDEC_NW_EDGES', '1') == '1'
+NW_NORM = os.environ.get('PALDEC_NW_NORM', 'inband')      # v6: inband | mean (v5)
+KSCALE_C = float(os.environ.get('PALDEC_KSCALE_C', 1.0))   # v6: extra scale on the chroma priors only
+KSCALE = float(os.environ.get('PALDEC_KSCALE', 1.0))     # v6: prior scale k x this (tuning on the corrected bench)
 PRIOR_MODE = os.environ.get('PALDEC_PRIORS', 'rec')
 REC_S = float(os.environ.get('PALDEC_REC_S', 0.15))     # rec priors / production priors (film and video solvers)
 VIDEO_W5 = os.environ.get('PALDEC_W5', '1') == '1'
@@ -99,7 +118,7 @@ REC_ST = float(os.environ.get('PALDEC_REC_ST', 0.4))     # same for their tempor
 def decoder_config(psd):
     """-> dict(noise_w, k, still=..., film=..., video=..., hanover=..., luma_lpf=...)
     for a stack with noise spectrum psd (noisepsd.noise_psd)."""
-    k = noise_sigma(psd) / 928.0
+    k = noise_sigma(psd) / 928.0 * KSCALE
     if NW_MODE == 'rec':
         nw = noise_weights(psd, floor=0.00625, ceil=0.025)
     elif NW_MODE == 'cap':          # minimal step: production floor, weights capped at 0.2
@@ -129,6 +148,12 @@ def decoder_config(psd):
         video.update(w5)
     # W5 needs 90 iterations with the production weights; with the rec weights 60 = 90 (converged)
     video['iters'] = int(os.environ.get('PALDEC_VITERS', 60 if NW_MODE == 'rec' else 90 if VIDEO_W5 else 60))
+    if KSCALE_C != 1.0:              # v6 tuning knob: chroma priors (spatial, temporal, Hanover) x this
+        for d in (still, film, video):
+            for q in ('lam_cx', 'lam_cy', 'lam_tc', 'lam_xmc'):
+                if q in d:
+                    d[q] *= KSCALE_C
+        hs *= KSCALE_C
     return dict(noise_w=nw, k=k, still=still, film=film, video=video, hanover=han * hs, hanover_video=hv * hs,
                 luma_lpf=float(os.environ.get('PALDEC_LUMA_LPF', LUMA_LPF_DEFAULT)))
 
@@ -686,7 +711,10 @@ def estimate_flow_gpu(Yf, bx=64, by=32, sx=32, sy=16, lag=1):
 #   PALDEC_HELD_FLOW=0.1    static gate: median over frame pairs of |median flow vector| (px), lags 1 and m/2
 HELD = os.environ.get('PALDEC_HELD', '1') == '1'
 HELD_MIN = int(os.environ.get('PALDEC_HELD_MIN', 3))
-HELD_T = float(os.environ.get('PALDEC_HELD_T', 3.0))
+HELD_LOCN = os.environ.get('PALDEC_HELD_LOCN', '1') == '1'   # v6: outlier threshold also relative to the block's own median
+# v6: 5 with HELD_LOCN (a 16x16 block of the blurred residual has few degrees of freedom: 3x its own median is
+# reached by noise alone in several % of blocks; bars 3092 green 9.5 -> 4.3, a cursor / highlight is 10-100x)
+HELD_T = float(os.environ.get('PALDEC_HELD_T', 5.0 if HELD_LOCN else 3.0))
 HELD_BLOCK = int(os.environ.get('PALDEC_HELD_BLOCK', 16))
 HELD_ITERS = int(os.environ.get('PALDEC_HELD_ITERS', 40))
 HELD_PS = float(os.environ.get('PALDEC_HELD_PS', 4.0))
@@ -700,6 +728,7 @@ HELD_MODE = os.environ.get('PALDEC_HELD_MODE', 'avg')   # avg: robust mean of th
 HELD_DMAX = float(os.environ.get('PALDEC_HELD_DMAX', 0.0))    # decoded-domain outlier test (8-bit): block max; 0 = test off (default: it rejects text/graphics edges, whose per-frame decode differs by subcarrier phase)
 HELD_DMEAN = float(os.environ.get('PALDEC_HELD_DMEAN', 6.0))  # ... and block mean
 HELD_RETEST_D = os.environ.get('PALDEC_HELD_RETEST_D', '0') == '1'
+HELD_DOW = os.environ.get('PALDEC_HELD_DOW', '1') == '1'     # v6: avg mode weights frames by their dropout mask
 HELD_DEBUG = {}
 HELD_KEEP = False                  # benches: keep the last weights in HELD_DEBUG['alpha']
 
@@ -724,7 +753,8 @@ def held_outliers(Z, C, cu, cv, block=None, T=None, Dm=1.0):
     band-limited residuals are disc noise plus Z's own error, which is the SAME for every
     frame; subtracting the per-pixel median over frames cancels it, leaving noise (the same
     level everywhere) plus any frame-specific content.  A block is an outlier when either
-    band's energy exceeds T x the global median block energy.  -> bool (m, 1, nby, nbx)"""
+    band's energy exceeds T x the global median block energy (v6: x max(that, the block's own median over
+    the frames)).  -> bool (m, 1, nby, nbx)"""
     import torch.nn.functional as Fn
     block = block or HELD_BLOCK; T = T or HELD_T
     with torch.no_grad():
@@ -732,11 +762,18 @@ def held_outliers(Z, C, cu, cv, block=None, T=None, Dm=1.0):
         bands = [[_gblur(r[:, None])], [_gblur((r * cu)[:, None]), _gblur((r * cv)[:, None])]]
         del r
         m, _, H, W = bands[0][0].shape
+        # v6: each frame's composite carries chroma gain / phase errors and sub-sample timing jitter the model leaves
+        # in the residual, so a saturated or edge block's residual is larger in EVERY frame; against one global
+        # threshold such blocks were outliers in a fraction of the frames, and with the one-block dilation they
+        # kept their own (unaveraged) solution - grain in saturated flat colour (South bars 3092, 10-bit luma rms
+        # cyan / green 16 / 12 vs white 1.3).  A block is now tested against T x max(global median, its own
+        # median over the run's frames): a change in a minority of frames still stands out (PALDEC_HELD_LOCN=0: v5)
         def test(center):
             out = None
             for fs in bands:
                 e = sum(Fn.avg_pool2d((f - center(f)) ** 2, block) for f in fs)
-                o = e > T * e.median()
+                n0 = e.median()
+                o = e > T * (torch.maximum(e.median(0, keepdim=True).values, n0) if HELD_LOCN else n0)
                 out = o if out is None else out | o
             return out
         out = test(lambda f: f.median(0, keepdim=True).values)
@@ -957,5 +994,12 @@ def solve_held(C, cu, cv, X, noise_w, still, hanover=0., iters=None, hanover_ite
             Z = torch.stack([y * 256, cb * 256 + 32768, cr * 256 + 32768])
         else:                            # 'avg': inlier-weighted mean of the per-frame solutions
             Z = (Xt * A[:, None]).sum(0) / A.sum(0).clamp(min=1e-3)[None]
+            if dmask is not None and HELD_DOW:
+                # v6: a frame's dropout pixels (its solve filled them from the priors) get its dropout-mask
+                # weight, so they come from the run's other frames; where every inlier has one, as v5
+                Aw = A * Dm
+                Zw = (Xt * Aw[:, None]).sum(0) / Aw.sum(0).clamp(min=1e-3)[None]
+                Z = torch.where(Aw.sum(0)[None] > 1e-3, Zw, Z)
+                del Aw, Zw
         o = A[:, None] * Z[None] + (1 - A[:, None]) * Xt
     return o.cpu().numpy()

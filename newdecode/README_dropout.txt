@@ -31,3 +31,30 @@ vertical interpolation a dropout pixel takes the mean of the previous / next fra
 clean and locally static (13x33 box mean |dY| and |dC| < 1.5 levels).  benchS3: 8.03/4.35 -> 7.98/4.29,
 never worse per segment; held 4.45 -> 4.19, bars 4.57 -> 4.33, motion patterns 8.29 -> 8.20.  The stills
 segments gain nothing: every CAV still frame is a different photograph.  Looser thresholds (4-6) cost chroma.
+
+v6 (2026-10-26) = v5 + review fixes.  Each is switchable; the v5 behaviour in brackets.
+Bench: fq benchS5 (make_bench now applies the disc channel smear H, the inverse of deghost's G (FQ_SMEAR,
+default 0.16,9), and writes dropouts at row fieldLine-1); before, the bench input was too sharp (noise-free
+decode luma gain 1-2 MHz 1.16 = 1/|H|) and every bench tuning was biased.
+ 1. PALDEC_DEGHOST=0 skips the deghost inverse (newdecode + vidsplice; part of the dg_cache stamp).
+ 2. Noise spectrum PALDEC_NOISE=active [vbi]: noisepsd.noise_psd_active - same-phase field differences
+    (k, k+8) after deghost+deherring, 16x232 blocks, per 0.54 MHz band the lowest-energy (static) mode;
+    guarded by the blank-line estimate (noisepsd.combine).  Blank lines see only the primary master:
+    South v8 stack: blank lines sigma 939 vs picture 330; bench Test Card: true 380-395, estimate 364.
+ 3. noise_psd (blank lines) is a per-bin median and skips fields with dropouts on those lines.
+ 4. DC / Nyquist rfft bins weighted once (PALDEC_NW_EDGES=0: twice); noise_sigma likewise.
+    + PALDEC_NW_NORM=inband [mean]: data weights scaled to the quietest 0-5 MHz band, not to the mean over all
+    bins, which the near-empty >7.5 MHz bins dominated (bench in-band weights all at the floor, real South
+    clips mostly at the cap: a 4x data/prior difference between bench and discs).
+    PALDEC_KSCALE / PALDEC_KSCALE_C: prior scale knobs (1 = best on benchS4; 2.5 worse).
+ 5. DOT threshold PALDEC_DOT x sigma / PALDEC_DOT_REF(600) [absolute: PALDEC_DOT_ABS=1].
+ 6. solve_held avg mode weights each frame by its dropout mask (PALDEC_HELD_DOW=0: v5).
+ 7. Windows end at run boundaries (extend to <= PALDEC_WIN_MAX=96 frames, else end where the run
+    starts; PALDEC_WIN_MAX=64: v5).
+ 8. doi_mask from the unclipped flagged span (v5 lost up to 4 flagged columns at the picture edges).
+ 9. A guard-fallback frame keeps the masked solve's luma in its holes through DOI (PALDEC_DOI_FB=interp: v5).
+10. vidsplice takes the levels from the TBC json (palmodel.set_levels, shared with newdecode).
+11. Held-run outlier test (optcore.held_outliers) against T x max(global median, the block's own median over
+    the run), T 5 (PALDEC_HELD_LOCN=0: v5, T 3).  Saturated / edge blocks have a larger residual in every
+    frame (player chroma errors, timing jitter) and were outliers in a fraction of the frames, which then kept
+    their own unaveraged solution: grain in saturated colour (South bars 3092).
