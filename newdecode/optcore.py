@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Core of the model-based PAL decoder (see optdec.py)."""
 import os, sys
 import numpy as np, torch
@@ -56,20 +57,24 @@ def _frame_loss_w(y, cb, cr, C, cu, cv, Dm, wf, AY, B0, lam_y, eps_y, lam_cx, la
     return loss / 65536.0
 
 
-def noise_weights(psd, floor=0.05, ceil=None):
+def noise_weights(psd, floor=0.05, ceil=None, norm='mean'):
     """Data-term weights from a noise PSD on the 928-sample row bins: 1/P,
     normalised to mean 1, floored so no band is ignored outright.  ceil: optional
     cap; the near-noiseless >7.5 MHz bins otherwise get weights ~7 against ~0.02
     in band, a stiff direction that leaves L-BFGS under-converged at 60 iterations."""
     w = 1.0 / np.maximum(psd, 1e-9)
-    if NW_NORM == 'inband':
+    if norm == 'inband':
         # v6: scaled so the quietest picture band (0-5 MHz, 0.5 MHz smoothed) sits at the cap; v5 divided by the
         # mean over all bins, which the near-noiseless bins above ~7.5 MHz (TBC low-pass) dominate, so the
         # in-band weights fell to the floor or rose to the cap depending on how quiet that band happened to be
         # (fq bench: all at the floor; real South clips: mostly at the cap, i.e. 4x the bench's data weight)
         f = np.fft.rfftfreq(2 * (len(psd) - 1), 1 / FS)
         sm = np.convolve(np.pad(psd, 13, mode='edge'), np.ones(27) / 27, 'valid')
-        w = w * float(np.min(sm[(f > 0.2) & (f < 5.0)])) * (ceil or 1.0)
+        # PALDEC_NW_REF: the in-band level that sits at the cap - 'min' (the quietest band) or pNN, the NN-th
+        # percentile of the 0.2-5 MHz spectrum (bins quieter than it are capped too)
+        ib = sm[(f > 0.2) & (f < 5.0)]
+        ref = float(np.min(ib)) if NW_REF == 'min' else float(np.percentile(ib, float(NW_REF[1:])))
+        w = w * ref * (ceil or 1.0)
     else:
         w = w / w.mean()
     w = np.maximum(w, floor)
@@ -96,16 +101,18 @@ def noise_sigma(psd):
 #   PALDEC_PRIORS=rec|prod  spatial/temporal prior strengths: rec = the stills-bench
 #                           values scaled by the stack's noise level k = sigma/928
 #   PALDEC_HANOVER=LAM      stage-2 Hanover prior weight (0 = off)
-#   PALDEC_W5=1|0           video solver motion terms (paldec_dev/vmotion W5), PALDEC_VITERS iterations (90)
+#   PALDEC_W5=1|0           video solver motion terms (W5), PALDEC_VITERS iterations (90)
 #   PALDEC_LUMA_LPF=MHZ     output luma roll-off (newdecode/vidsplice default)
 #   PALDEC_PARAMS=FILE      carrier calibration json (palmodel; default model_params.json)
 #   further knobs: PALDEC_LAMY_SCALE (luma prior x, grain vs detail), PALDEC_REC_S / PALDEC_REC_ST
 #   (film/video spatial / temporal prior scale, 0.15 / 0.4), PALDEC_HANOVER_VIDEO (field
 #   Hanover stage, default 64 since v4), PALDEC_HANOVER_G0 / _MASKN (stage-2 edge mask, 12 / 9),
-#   PALDEC_HCOMPILE (compile the stage-2 prior, 1).  Production behaviour:
-#   PALDEC_PARAMS=<old json> PALDEC_NW=prod PALDEC_PRIORS=prod PALDEC_HANOVER=0 PALDEC_W5=0
+#   PALDEC_HCOMPILE (compile the stage-2 prior, 1).  Production behaviour of 2026-10-13:
+#   PALDEC_PARAMS=<old json> PALDEC_NW=prod PALDEC_PRIORS=prod PALDEC_HANOVER=0 PALDEC_W5=0, and for v6 also
+#   PALDEC_NOISE=vbi PALDEC_NW_EDGES=0 (see README_dropout.txt for the other v6 switches)
 NW_MODE = os.environ.get('PALDEC_NW', 'rec')
 NW_EDGES = os.environ.get('PALDEC_NW_EDGES', '1') == '1'
+NW_REF = os.environ.get('PALDEC_NW_REF', 'min')   # v6 agent 10-27: p75 (sharper maps, +15% flat grain) vs min (v6_0); see integration notes
 NW_NORM = os.environ.get('PALDEC_NW_NORM', 'inband')      # v6: inband | mean (v5)
 KSCALE_C = float(os.environ.get('PALDEC_KSCALE_C', 1.0))   # v6: extra scale on the chroma priors only
 KSCALE = float(os.environ.get('PALDEC_KSCALE', 1.0))     # v6: prior scale k x this (tuning on the corrected bench)
@@ -120,7 +127,7 @@ def decoder_config(psd):
     for a stack with noise spectrum psd (noisepsd.noise_psd)."""
     k = noise_sigma(psd) / 928.0 * KSCALE
     if NW_MODE == 'rec':
-        nw = noise_weights(psd, floor=0.00625, ceil=0.025)
+        nw = noise_weights(psd, floor=0.00625, ceil=0.025, norm=NW_NORM)   # v6: PALDEC_NW=prod / cap keep the v5 mean
     elif NW_MODE == 'cap':          # minimal step: production floor, weights capped at 0.2
         nw = noise_weights(psd, ceil=0.2)
     else:
@@ -144,7 +151,7 @@ def decoder_config(psd):
         w5 = dict(lam_xm=0.1, lam_xmc=0.1, hp_pow=4., hp_pow1=2., lam_t4=0.1)
         hs = 1.0
     hv = float(os.environ.get('PALDEC_HANOVER_VIDEO', 64))  # v4: on, as stills (bars 3028-3031 zipper: same-field chroma alternation 7.8-9.7 -> 0.5-0.7); video bench -0.1 dB chroma, +35% video-solve time
-    if VIDEO_W5:                     # paldec_dev/vmotion 'W5' motion terms for solve_fields
+    if VIDEO_W5:                     # 'W5' motion terms for solve_fields
         video.update(w5)
     # W5 needs 90 iterations with the production weights; with the rec weights 60 = 90 (converged)
     video['iters'] = int(os.environ.get('PALDEC_VITERS', 60 if NW_MODE == 'rec' else 90 if VIDEO_W5 else 60))
@@ -592,16 +599,40 @@ def _warp(img, flow):
                           padding_mode='border', align_corners=True)[:, 0]
 
 
-def _film_loss(y, cb, cr, C, cu, cv, Dm, wf, grid, AY, B0, lam_y, eps_y, lam_cx, lam_cy, eps_c, lam_t, eps_t, lam_tc):
+def _film_loss(y, cb, cr, C, cu, cv, Dm, wf, grid, tm, AY, B0, lam_y, eps_y, lam_cx, lam_cy, eps_c, lam_t, eps_t, lam_tc):
     """solve_film's objective as one function of tensors so torch.compile can
-    fuse it; `grid` is the motion-compensating sampling grid, built once."""
+    fuse it; `grid` is the motion-compensating sampling grid, built once; tm (N, H, W) the temporal prior's
+    per-pixel weight (film_tmask)."""
     import torch.nn.functional as Fn
     l = _frame_loss_w(y, cb, cr, C, cu, cv, Dm, wf, AY, B0, lam_y, eps_y, lam_cx, lam_cy, eps_c) * 65536.0
     Y, Cb, Cr = y * 256, cb * 256, cr * 256
     wp = lambda x: Fn.grid_sample(x[:-1, None], grid, mode='bicubic', padding_mode='border', align_corners=True)[:, 0]
-    l = l + lam_t * _charb(Y[1:] - wp(Y), eps_t)
-    l = l + lam_tc * (_charb(Cb[1:] - wp(Cb), eps_c) + _charb(Cr[1:] - wp(Cr), eps_c))
+    ch = lambda d, e: e * (tm * torch.sqrt(d ** 2 + e ** 2)).sum()
+    l = l + lam_t * ch(Y[1:] - wp(Y), eps_t)
+    l = l + lam_tc * (ch(Cb[1:] - wp(Cb), eps_c) + ch(Cr[1:] - wp(Cr), eps_c))
     return l / 65536.0
+
+
+FILM_TM_LO = float(os.environ.get('PALDEC_FILM_TM_LO', 3000.))   # 16-bit; 0 = off (v6_0: temporal prior everywhere)
+FILM_TM_HI = float(os.environ.get('PALDEC_FILM_TM_HI', 8000.))
+FILM_TM_MIN = float(os.environ.get('PALDEC_FILM_TM_MIN', 0.05))
+
+
+def film_tmask(init, grid):
+    """2026-10-28 (herring integration): where a frame's init differs from the motion-compensated previous init
+    by far more than noise (a cursor / highlight / text change inside a film or held run: synthetic 3-state test
+    ghost 24 8-bit levels), the temporal prior is weakened there (x FILM_TM_MIN above FILM_TM_HI), so the change
+    is not averaged with its neighbour.  -> (N, H, W) torch"""
+    import torch.nn.functional as Fn
+    Yi = torch.as_tensor(np.asarray(init)[:, 0], dtype=torch.float32, device=dev)
+    if FILM_TM_LO <= 0:
+        return torch.ones_like(Yi[1:])
+    d = (Yi[1:] - Fn.grid_sample(Yi[:-1, None], grid, mode='bilinear', padding_mode='border', align_corners=True)[:, 0]).abs()
+    k = torch.ones((1, 1, 5, 9), device=dev) / 45.0
+    d = Fn.conv2d(d[:, None], k, padding=(2, 4))[:, 0]
+    a = ((d - FILM_TM_LO) / (FILM_TM_HI - FILM_TM_LO)).clamp(0, 1)
+    a = Fn.max_pool2d(a[:, None], (5, 9), stride=1, padding=(2, 4))[:, 0]
+    return 1 - (1 - FILM_TM_MIN) * a
 
 
 _film_loss_c = None
@@ -633,7 +664,8 @@ def solve_film(C, cu, cv, init, flow, noise_w=None, lam_y=0.04, eps_y=1200., lam
                         (yy[None] - FL[..., 1]) / (h - 1) * 2 - 1], -1)
     consts = (AY, B0, float(lam_y), float(eps_y), float(lam_cx), float(lam_cy), float(eps_c),
               float(lam_t), float(eps_t), float(lam_tc))
-    objective = lambda: _film_loss_c(y, cb, cr, C, cu, cv, Dm, wf, grid, *consts)
+    tm = film_tmask(init, grid)
+    objective = lambda: _film_loss_c(y, cb, cr, C, cu, cv, Dm, wf, grid, tm, *consts)
 
     opt = torch.optim.LBFGS([y, cb, cr], lr=lr, max_iter=iters, history_size=HIST,
                             line_search_fn='strong_wolfe', tolerance_grad=1e-9, tolerance_change=1e-12)
@@ -683,7 +715,7 @@ def estimate_flow_gpu(Yf, bx=64, by=32, sx=32, sy=16, lag=1):
     return out.cpu().numpy()
 
 
-# ---- held stills: combine every repeat of a static run (paldec_dev/heldavg, 2026-10-14) ----
+# ---- held stills: combine every repeat of a static run (2026-10-14) ----
 # A held still is a run of separate disc frames carrying the identical picture, each with
 # independent disc noise.  After the per-frame film solve (the candidate path):
 #   1. static gate (held_static): no pan/drift between the frames' solutions
@@ -715,11 +747,17 @@ HELD_LOCN = os.environ.get('PALDEC_HELD_LOCN', '1') == '1'   # v6: outlier thres
 # v6: 5 with HELD_LOCN (a 16x16 block of the blurred residual has few degrees of freedom: 3x its own median is
 # reached by noise alone in several % of blocks; bars 3092 green 9.5 -> 4.3, a cursor / highlight is 10-100x)
 HELD_T = float(os.environ.get('PALDEC_HELD_T', 5.0 if HELD_LOCN else 3.0))
+HELD_LOCK = float(os.environ.get('PALDEC_HELD_LOCK', 10.0))   # v6: cap of the local term, x the global median
+HELD_Q = os.environ.get('PALDEC_HELD_Q', '1') == '1'           # v6 10-27: lower quartile + cap (0: v6_0's own median, ghosting)
 HELD_BLOCK = int(os.environ.get('PALDEC_HELD_BLOCK', 16))
 HELD_ITERS = int(os.environ.get('PALDEC_HELD_ITERS', 40))
 HELD_PS = float(os.environ.get('PALDEC_HELD_PS', 4.0))
 HELD_PSC = float(os.environ.get('PALDEC_HELD_PSC', 1.0))     # extra chroma prior scale
 HELD_FLOW = float(os.environ.get('PALDEC_HELD_FLOW', 0.1))
+HELD_DRIFT = float(os.environ.get('PALDEC_HELD_DRIFT', 0.5))     # px over the run; 0 = off (v6_0)
+HELD_MOVK = float(os.environ.get('PALDEC_HELD_MOVK', 6.0))
+HELD_MOVFRAC = float(os.environ.get('PALDEC_HELD_MOVFRAC', 0.02))   # 0 = off (v6_0)
+HELD_APERTURE = float(os.environ.get('PALDEC_HELD_APERTURE', 0.1))   # 0: v6_0 (both flow components always tested)
 HELD_T1 = float(os.environ.get('PALDEC_HELD_T1', 10))      # first (gross) outlier pass: T x T1, before the mismatch fit
 HELD_DGRID = int(os.environ.get('PALDEC_HELD_DGRID', 32))  # per-frame mismatch correction grid (px; 0 = off)
 HELD_LAMD = float(os.environ.get('PALDEC_HELD_LAMD', 1e-4))  # its (weak) size penalty
@@ -753,8 +791,8 @@ def held_outliers(Z, C, cu, cv, block=None, T=None, Dm=1.0):
     band-limited residuals are disc noise plus Z's own error, which is the SAME for every
     frame; subtracting the per-pixel median over frames cancels it, leaving noise (the same
     level everywhere) plus any frame-specific content.  A block is an outlier when either
-    band's energy exceeds T x the global median block energy (v6: x max(that, the block's own median over
-    the frames)).  -> bool (m, 1, nby, nbx)"""
+    band's energy exceeds T x the global median block energy (v6: x max(that, min(the block's own lower
+    quartile over the frames, HELD_LOCK x that)); PALDEC_HELD_Q=0: its median, no cap).  -> bool (m, 1, nby, nbx)"""
     import torch.nn.functional as Fn
     block = block or HELD_BLOCK; T = T or HELD_T
     with torch.no_grad():
@@ -766,14 +804,21 @@ def held_outliers(Z, C, cu, cv, block=None, T=None, Dm=1.0):
         # in the residual, so a saturated or edge block's residual is larger in EVERY frame; against one global
         # threshold such blocks were outliers in a fraction of the frames, and with the one-block dilation they
         # kept their own (unaveraged) solution - grain in saturated flat colour (South bars 3092, 10-bit luma rms
-        # cyan / green 16 / 12 vs white 1.3).  A block is now tested against T x max(global median, its own
-        # median over the run's frames): a change in a minority of frames still stands out (PALDEC_HELD_LOCN=0: v5)
+        # cyan / green 16 / 12 vs white 1.3).  A block is now tested against T x max(n0, min(q, HELD_LOCK x n0)):
+        # n0 the global median, q the block's lower quartile over the run's frames.  The quartile (not the median)
+        # still flags a change that appears mid-run and stays (half the frames or more: text, a highlight), and
+        # the cap bounds the local term if it covers nearly all frames (PALDEC_HELD_LOCN=0: v5)
+        kq = max(1, m // 4)
         def test(center):
             out = None
             for fs in bands:
                 e = sum(Fn.avg_pool2d((f - center(f)) ** 2, block) for f in fs)
                 n0 = e.median()
-                o = e > T * (torch.maximum(e.median(0, keepdim=True).values, n0) if HELD_LOCN else n0)
+                if HELD_LOCN and HELD_Q:
+                    q = e.kthvalue(kq, dim=0, keepdim=True).values
+                    o = e > T * torch.clamp(q, min=float(n0), max=float(HELD_LOCK * n0))
+                else:
+                    o = e > T * (torch.maximum(e.median(0, keepdim=True).values, n0) if HELD_LOCN else n0)
                 out = o if out is None else out | o
             return out
         out = test(lambda f: f.median(0, keepdim=True).values)
@@ -862,7 +907,7 @@ def _held_matrix(mx, H):
     identity, zero mean over frames and classes -> per-row coefficient maps (m, H, 1) each.
     Real discs: each frame's composite carries a line-alternating chroma crosstalk (V into
     the U carrier ~ +-0.3, gain errors ~0.2, sign flipping frame to frame) that one exact
-    carrier model cannot represent for all frames at once (paldec_dev/heldavg/REPORT.md)."""
+    carrier model cannot represent for all frames at once."""
     m = mx.shape[0]
     mx = (mx - mx.mean((0, 1), keepdim=True)) / 256
     q = torch.arange(H, device=mx.device) % 4
@@ -902,18 +947,62 @@ def held_static(Y):
     Tested at lag 1 and at lag m/2, so slow drifts that would blur when averaged
     (bench: 0.05-0.1 px/frame pans) are caught: both medians must stay below HELD_FLOW."""
     Y = np.asarray(Y, np.float32)
+    if os.environ.get('PALDEC_HELD_DUMP'):          # calibration: keep the run's luma
+        import glob as _g
+        np.save(f"{os.environ['PALDEC_HELD_DUMP']}_{len(_g.glob(os.environ['PALDEC_HELD_DUMP'] + '_*'))}.npy", Y.astype(np.uint16))
     worst = 0.0
+    # 2026-10-27 (herring integration): aperture.  A picture with structure in one direction only (colour bars: vertical
+    # edges, no vertical detail) gives no measurable motion along the other; phase correlation returns noise there
+    # (North bars 3027-3046: median dy 0.6-0.7 px, dx 0.01 -> "moving", no held averaging, grain 18.6 vs 5.8).  When
+    # vertical carries < HELD_APERTURE of the frame's gradient energy, the vertical flow component is not tested.
+    # Measured on the frame-line-pair mean (the fields' own difference is not vertical structure), sigma 2 smoothed:
+    # bars 0.03, test card / photos / maps / text / video 0.5-0.97.  Only the vertical component is exempted.
+    ycomp = None
+    if HELD_APERTURE > 0:
+        from scipy.ndimage import gaussian_filter
+        Z = gaussian_filter(0.5 * (Y[0][0::2] + Y[0][1::2]), 2.0)[8:-8, 8:-8]
+        gx = float((np.diff(Z, axis=1) ** 2).sum()); gy = 4 * float((np.diff(Z, axis=0) ** 2).sum())
+        HELD_DEBUG['gy_frac'] = gy / (gx + gy + 1e-9)
+        if gy < HELD_APERTURE * (gx + gy): ycomp = 1
     for L in sorted({1, max(1, len(Y) // 2)}):
         if len(Y) <= L:
             continue
         f = estimate_flow_gpu(Y, lag=L)[L:]
         v = np.median(f.reshape(len(f), -1, 2), axis=1)
+        if ycomp is not None:
+            v[:, ycomp] = 0
         worst = max(worst, float(np.median(np.hypot(v[:, 0], v[:, 1]))))
     HELD_DEBUG['flow'] = worst
-    return worst < HELD_FLOW
+    # 2026-10-28 (herring integration): cumulative drift.  A slow pan (NationalB 69431-69460, ~0.2 px/frame) can pass
+    # the per-pair medians on noisy solutions yet moves px over the run; averaged as a held still it blurs and its
+    # outlier blocks keep per-frame noise (motion combing x1.19).  Displacement first -> each later frame, linear fit
+    # through 0: slope x (m - 1) is the run's drift; a true still drifts ~0.
+    HELD_DEBUG['drift'] = 0.0
+    if HELD_DRIFT > 0 and len(Y) >= 3:
+        d = []
+        for j0 in range(1, len(Y), 16):                                          # pairs (first, j): flow at odd entries
+            f = estimate_flow_gpu(np.stack([Y[k] for j in range(j0, min(len(Y), j0 + 16)) for k in (0, j)]), lag=1)[1::2]
+            d.append(np.median(f.reshape(len(f), -1, 2), axis=1))
+        d = np.concatenate(d).astype(np.float64)
+        if ycomp is not None:
+            d[:, ycomp] = 0
+        t = np.arange(1, len(Y), dtype=np.float64)
+        sl = (t[:, None] * d).sum(0) / (t * t).sum()
+        HELD_DEBUG['drift'] = float(np.hypot(*sl) * (len(Y) - 1))
+    # local motion on a static background (NationalB 69442 figures in an inset, Countryside / City_Financial talking
+    # heads) leaves the median flow and the drift ~0; its 32 px blocks differ first -> last frame by > HELD_MOVK x the
+    # picture's median block difference (noise).  Fraction of such blocks, quickcheck panels' held candidates: true
+    # stills (bars, test card, maps, menus, UN / South / north2 held runs) 0.000-0.008, local motion 0.03-0.20.
+    from scipy.ndimage import gaussian_filter
+    D = np.abs(gaussian_filter(Y[-1], 1.0) - gaussian_filter(Y[0], 1.0))[8:-8, 8:-8]
+    hb, wb = D.shape[0] // 32, D.shape[1] // 32
+    b = D[:hb * 32, :wb * 32].reshape(hb, 32, wb, 32).mean((1, 3))
+    HELD_DEBUG['movfrac'] = float((b > HELD_MOVK * np.median(b)).mean())
+    return worst < HELD_FLOW and HELD_DEBUG['drift'] < (HELD_DRIFT if HELD_DRIFT > 0 else np.inf) \
+        and HELD_DEBUG['movfrac'] < (HELD_MOVFRAC if HELD_MOVFRAC > 0 else np.inf)
 
 
-def solve_held(C, cu, cv, X, noise_w, still, hanover=0., iters=None, hanover_iters=30, lr=1e4, dmask=None):
+def solve_held(C, cu, cv, X, noise_w, still, hanover=0., iters=None, hanover_iters=30, lr=1e4, dmask=None, own=None):
     """C, cu, cv: (m, H, W) torch for the m frames of a static run; X (m, 3, H, W) numpy:
     their per-frame solutions.  Returns (m, 3, H, W) numpy: the shared latent where each
     frame agrees with the consensus, its own solution elsewhere.
@@ -957,7 +1046,7 @@ def solve_held(C, cu, cv, X, noise_w, still, hanover=0., iters=None, hanover_ite
         _held_loss_c = torch.compile(_held_loss, dynamic=True)
     # priors scale with the run length: the data term is the sum of m frames' terms, and on
     # real discs a prior that does not grow with it lets the latent follow the data into
-    # bands the single-frame priors keep quiet (split-half noise test, REPORT.md)
+    # bands the single-frame priors keep quiet (split-half noise test)
     ps = HELD_PS * max(1.0, m / 8.0) ** 0.5
     consts = (float(M.P['AY']), float(M.P['B']), float(still['lam_y']) * ps, float(still['eps_y']),
               float(still['lam_cx']) * ps * HELD_PSC, float(still['lam_cy']) * ps * HELD_PSC, float(still['eps_c']), float(lam_d))
@@ -1001,5 +1090,7 @@ def solve_held(C, cu, cv, X, noise_w, still, hanover=0., iters=None, hanover_ite
                 Zw = (Xt * Aw[:, None]).sum(0) / Aw.sum(0).clamp(min=1e-3)[None]
                 Z = torch.where(Aw.sum(0)[None] > 1e-3, Zw, Z)
                 del Aw, Zw
+        if own is not None:              # outlier blocks take these per-frame solutions instead (local-motion runs: video)
+            Xt = torch.as_tensor(np.asarray(own, np.float32), device=dev)
         o = A[:, None] * Z[None] + (1 - A[:, None]) * Xt
     return o.cpu().numpy()

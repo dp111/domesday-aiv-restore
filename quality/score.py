@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Score an fq benchmark run against the known truth, per frame (fq benchmark, 2026-10-24).
 
   score.py <benchdir> <label> [<label2> ...]     score each label; with 2+ labels also print the change

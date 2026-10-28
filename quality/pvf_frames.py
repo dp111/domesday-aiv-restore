@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Write a .pvf's video as one Annex-B H.264 stream in frame order (fq, 2026-10-24).
 
   pvf_frames.py video.pvf > video.h264

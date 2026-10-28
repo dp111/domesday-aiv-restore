@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
-verify_pvf.py - sanity check a .pvf built by make_pvf.py
+verify_pvf.py - sanity check a .pvf built by make_pvfv2.py
 
 Checks the header, index monotonicity, per-record NAL structure
 (SPS+PPS+IDR = standalone decodable), that sampled records really do

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Pipeline settings and helpers, sourced by run.sh, decodeq.sh, side.sh, prio.sh and gpugate.sh.
 B=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)             # this directory
 . "$B/../config.sh"

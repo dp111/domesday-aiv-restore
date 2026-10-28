@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Decoder-independent truth for the fq benchmark: 128 frames of ffmpeg test patterns, 928x576 yuv444p16le
 # (limited range, as newdecode / ld-chroma-decoder output): 32 moving test card, 32 moving zone plate,
 # 32 Mandelbrot zoom (fine detail), 32 still PAL 75% bars (a held still); then made PAL-legal (legalise_pal.py).

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Dropout-fill test (fq, 2026-10-24; user: "use the line before and the line afterwards as well").
   prep.py <segdir>   -> <segdir>/dofill/{inj.tbc,inj.tbc.json, avg.tbc,avg.tbc.json, mask.npy}
-inj  = the fix4 stacked composite with syn_ds3's real dropout shapes added (value 16384 + 3000 N(0,1), as
+inj  = the stacked composite of the run_bench.sh label fix4 (<segdir>/fix4/stack.tbc, run that label first)
+       with the synthetic capture syn_ds3's real dropout shapes added (value 16384 + 3000 N(0,1), as
        make_bench does), flagged in the json together with the stack's own leftovers.
 avg  = inj with every flagged sample replaced by linear interpolation between the nearest phase-matched
        clean lines above and below, from either field (PAL: same field +-4 lines; other field N-3 / N+1

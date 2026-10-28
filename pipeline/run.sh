@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Start the whole pipeline (conf.sh, sides.conf): the decode queue + one side.sh per side; the sides wait
 # for their captures and for stack / GPU / PVF slots.  Run prio.sh and gpugate.sh beside it.
 . "$(dirname "${BASH_SOURCE[0]}")/conf.sh"

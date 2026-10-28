@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Run newdecode/newdecode.py with a GPU-memory workaround (2026-10-18); no change to its maths.
 
   nd_gpuwrap.py /path/newdecode.py <newdecode args...>

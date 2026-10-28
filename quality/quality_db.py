@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Per-frame picture-quality record of every side and version, in one SQLite database (fq, 2026-10-24).
 
 User: "can a record of the quality of each frame at the end" / "I think we should use the sql stuff".
@@ -6,7 +7,7 @@ Database: quality.db beside this script (override with FQ_DB).  One run = one si
 version; re-importing a source for a run replaces that source's rows, so it is safe to re-run.
 
   quality_db.py run <side> <label> [key=value ...]      create/update a run, print its id
-        keys recorded as run metadata, e.g. ld=862df7c6 stacker=3dda464d nd=v5-levels master=yuv422p10le
+        keys recorded as run metadata, e.g. ld=862df7c6 stacker=3dda464d nd=<decoder dir>:<md5> master=yuv422p10le
   quality_db.py stack <run> <stack_frames.tsv>           stacker per frame (LDSTACK_FRAME_STATS)
   quality_db.py fields <run> <fq_side.csv>               per field: blank-line noise bands, dropouts, VITS
   quality_db.py nd <run> <satratio.txt> [classes.txt]    newdecode per frame: sat guard, frame class
@@ -17,7 +18,11 @@ Tables: runs, stack_frames, fields, nd_frames, pvf_frames; view frame_quality jo
 (fields averaged over the frame's two fields).  Frame = output frame index of the stack = master frame
 (fields 2n, 2n+1 = frame n, as newdecode pairs them).  2026-10-26: the view lists every frame any table
 has (it used to start from fields, so a run whose field import failed had no rows at all), and every
-connection waits up to 2 minutes for a lock (several sides write at once).
+connection waits up to 2 minutes for a lock (several sides write at once).  2026-10-27: the schema is
+created once per SCHEMA_VERSION (PRAGMA user_version), not on every connection; WAL journal when the
+database is on a local filesystem (SQLite's WAL is not safe on network filesystems such as a WSL drvfs (9p)
+mount, which keeps the rollback journal).  `stack` with a missing TSV clears the run's stack_frames
+(a side rebuilt from a single capture has none).
 """
 import csv
 import os
@@ -61,10 +66,30 @@ CREATE VIEW frame_quality AS
 """
 
 
+SCHEMA_VERSION = 2          # bump when SCHEMA changes
+
+
+def local_fs(path):
+    """True unless path is on a network / 9p / FUSE filesystem (by /proc/mounts, longest mount prefix)."""
+    path, best, typ = os.path.realpath(path), '', ''
+    try:
+        for ln in open('/proc/mounts'):
+            f = ln.split()
+            mnt = f[1].replace('\\040', ' ')
+            if (path == mnt or path.startswith(mnt.rstrip('/') + '/')) and len(mnt) > len(best):
+                best, typ = mnt, f[2]
+    except OSError:
+        return False
+    return not (typ in ('9p', 'nfs', 'nfs4', 'cifs', 'smb3', 'drvfs') or typ.startswith('fuse'))
+
+
 def db():
     c = sqlite3.connect(DB, timeout=120)
     c.execute('PRAGMA busy_timeout = 120000')
-    c.executescript(SCHEMA)
+    if local_fs(os.path.dirname(os.path.abspath(DB))):
+        c.execute('PRAGMA journal_mode = WAL')
+    if c.execute('PRAGMA user_version').fetchone()[0] < SCHEMA_VERSION:
+        c.executescript('BEGIN IMMEDIATE;' + SCHEMA + f'PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;')
     return c
 
 
@@ -86,6 +111,10 @@ def cmd_run(c, side, label, *kv):
 def cmd_stack(c, run, tsv):
     run = int(run)
     rows = []
+    if not os.path.exists(tsv):
+        c.execute('DELETE FROM stack_frames WHERE run=?', (run,))
+        print(f'stack_frames: no {tsv} - cleared')
+        return
     with open(tsv) as fh:
         for r in csv.DictReader(fh, delimiter='\t'):
             rows.append((run, int(r['frame']), num(r['picture'], int), int(r['avail']), int(r['used']),
@@ -148,14 +177,15 @@ def cmd_summary(c, *runs):
         s = c.execute('''SELECT COUNT(*), AVG(used), MIN(used), SUM(used < avail), SUM(filled), SUM(repaired),
                                 SUM(resid_do) FROM stack_frames WHERE run=?''', (run,)).fetchone()
         f = c.execute('SELECT AVG(bl_rms), AVG(wsnr), SUM(do_samples) FROM fields WHERE run=?', (run,)).fetchone()
-        n = c.execute('SELECT COUNT(*), AVG(satratio), SUM(sat_fallback) FROM nd_frames WHERE run=?', (run,)).fetchone()
+        n = c.execute('SELECT COUNT(*), COUNT(satratio), AVG(satratio), SUM(sat_fallback) FROM nd_frames WHERE run=?',
+                      (run,)).fetchone()
         p = c.execute('SELECT AVG(psnr_y), MIN(psnr_y), AVG(ssim_y) FROM pvf_frames WHERE run=?', (run,)).fetchone()
         fmt = lambda v, f='%.2f': '-' if v is None else f % v
         print(f'run {run} {side} {label}: {s[0]} frames, captures used avg {fmt(s[1])} min {fmt(s[2], "%d")}, '
               f'{fmt(s[3], "%d")} frames with a capture rejected, filled {fmt(s[4], "%d")} px, repaired '
               f'{fmt(s[5], "%d")} px, residual dropout {fmt(s[6], "%d")} samples | blank-line noise {fmt(f[0])}, '
-              f'VITS wSNR {fmt(f[1])} dB | newdecode {n[0]} video frames, satratio {fmt(n[1], "%.3f")}, '
-              f'fallbacks {fmt(n[2], "%d")} | PVF PSNR-Y avg {fmt(p[0])} min {fmt(p[1])}, SSIM-Y {fmt(p[2], "%.4f")}'
+              f'VITS wSNR {fmt(f[1])} dB | newdecode {n[0]} frames decoded, {n[1]} video-solved, satratio {fmt(n[2], "%.3f")}, '
+              f'fallbacks {fmt(n[3], "%d")} | PVF PSNR-Y avg {fmt(p[0])} min {fmt(p[1])}, SSIM-Y {fmt(p[2], "%.4f")}'
               f'{"  [" + meta + "]" if meta else ""}')
 
 

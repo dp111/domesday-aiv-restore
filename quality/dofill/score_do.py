@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Score dropout fills inside the flagged pixels against the truth (see prep.py).
   score_do.py   -> table per segment: RMS error (8-bit) of Y and of Cb/Cr inside the dropout mask
-Reference fix4_lv = the same stack WITHOUT the added dropouts (the floor). Variants: dfA..dfD (newdecode outputs), E = dfA + decoded-picture interpolation from the nearest clean rows
+Reference fix4_lv = a run_bench.sh label decoding the same stack WITHOUT the added dropouts (the floor). Variants: dfA..dfD (newdecode outputs), E = dfA + decoded-picture interpolation from the nearest clean rows
 above/below in the same field (rows +-2, +-4 ...), E1 = same with the other field's rows +-1 allowed; E1C = E1 applied to dfC (production), mixC = mean of dfC and E1C.
 """
 import numpy as np, os, sys
 from scipy.ndimage import binary_dilation
-B = os.environ.get('FQ_BENCH', 'benchS3'); FW, FH = 928, 576
+B = os.environ.get('FQ_BENCH') or sys.exit('set FQ_BENCH=<make_bench.py benchmark dir>'); FW, FH = 928, 576
 SEGS = ['seg03000', 'seg08000', 'seg16256', 'seg29696', 'seg50112', 'pat40000']
 def interp(o, M, step_rows):
     """fill masked pixels of o (3,H,W) by linear interpolation between nearest unmasked rows (offsets in step_rows)"""

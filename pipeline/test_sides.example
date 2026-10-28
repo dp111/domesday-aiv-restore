@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Example V7_TEST file (sourced by conf.sh after sides.conf): a side table of your own, e.g. for ready-made
+# TBCs or a short test.  Copy it, edit it, then
+#   V7_TEST=/path/to/my_sides pipeline/side.sh MyTest
+# The capture glob may match nothing: side.sh then takes the captures recorded in $CAPS/<side>/*.path.
+# order  name     slot(s)  clv  capture glob (one capture per match)
+V7_SIDES="
+1  MyTest  30  0  /nonexistent/*.ldf
+"
+# Anything else from conf.sh / config.sh can be overridden here too, e.g. a separate state dir and log:
+# V7=$WORK/test-state CAPS=$V7/caps LOG=$WORK/test.log

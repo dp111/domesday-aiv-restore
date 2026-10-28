@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Probe .ldf captures for the LD-V4300D ~8.47/8.56 MHz CW spur.
 Reads a mid-disc RF window, Welch-PSDs it, and reports the peak-over-floor
 ratio in 8.30-8.70 MHz. Prints: name  peak_dB  freq_MHz  verdict."""

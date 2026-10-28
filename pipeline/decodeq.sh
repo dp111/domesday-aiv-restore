@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Capture-decode queue: every capture of every side in sides.conf, in side order, V7_WIDE (4) at a time,
 # so the next side's captures decode while the previous side stacks.  Each decode goes to the drive with
 # most room (config V7_DRIVES) and is announced to its side as $CAPS/<side>/<cap>.path (tbc base) +
@@ -17,7 +18,7 @@ pick_dir(){ # <bytes needed> -> dir with most room above reserve, or nothing
   local need=$1 best= bestfree=0 d dir mnt res free
   for d in $V7_DRIVES; do
     IFS=: read -r dir mnt res <<< "$d"
-    free=$(df --output=avail -B1 "$mnt" | tail -1); free=$((free - res * 1000000000 - PENDING_${mnt//\//_}))
+    free=$(df --output=avail -B1 "$mnt" | tail -1); free=$((free - res * 1000000000 - PENDING_${mnt//[^A-Za-z0-9_]/_}))
     [ "$free" -gt "$need" ] && [ "$free" -gt "$bestfree" ] && { best=$dir; bestfree=$free; }
   done
   echo "$best"
@@ -38,14 +39,14 @@ nalive(){ local p q k=0
 
 pending(){ # <need of a record without .need>: PENDING_<mount> = what the running decodes have yet to write there
   local d m p q dd r dir v
-  for d in $V7_DRIVES; do IFS=: read -r _ m _ <<< "$d"; declare -g "PENDING_${m//\//_}=0"; done
+  for d in $V7_DRIVES; do IFS=: read -r _ m _ <<< "$d"; declare -g "PENDING_${m//[^A-Za-z0-9_]/_}=0"; done
   for p in "$CAPS"/*/*.path; do
     [ -e "$p" ] || continue; q=${p%.path}; [ -e "$q.done" ] || [ -e "$q.failed" ] && continue
     alive "$q" || continue
     dd=$(cat "$p"); r=$(( $(cat "$q.need" 2> /dev/null || echo "$1") - $(stat -c %s "$dd.tbc" 2> /dev/null || echo 0) ))
     [ $r -gt 0 ] || r=0
     for d in $V7_DRIVES; do IFS=: read -r dir m _ <<< "$d"
-      [[ $dd == $dir/* ]] && { v=PENDING_${m//\//_}; declare -g "$v=$(( ${!v} + r ))"; }; done
+      [[ $dd == $dir/* ]] && { v=PENDING_${m//[^A-Za-z0-9_]/_}; declare -g "$v=$(( ${!v} + r ))"; }; done
   done
 }
 
@@ -84,7 +85,7 @@ for s in $(echo "$V7_SIDES" | awk 'NF {print $2}'); do
     pending "$need"
     dir=$(pick_dir "$need"); waited=0
     while [ -z "$dir" ]; do
-      [ $waited = 0 ] && log "$s $c waits for disk space ($((need / 1000000000)) GB; running decodes still to write:$(for d in $V7_DRIVES; do IFS=: read -r _ m _ <<< "$d"; v=PENDING_${m//\//_}; echo -n " $m $((${!v} / 1000000000)) GB"; done))"
+      [ $waited = 0 ] && log "$s $c waits for disk space ($((need / 1000000000)) GB; running decodes still to write:$(for d in $V7_DRIVES; do IFS=: read -r _ m _ <<< "$d"; v=PENDING_${m//[^A-Za-z0-9_]/_}; echo -n " $m $((${!v} / 1000000000)) GB"; done))"
       waited=1; sleep 300; pending "$need"; dir=$(pick_dir "$need")
     done
     mkdir -p "$dir"; echo "$dir/${s}_$c" > "$ca.path"; echo "$need" > "$ca.need"

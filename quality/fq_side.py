@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Per-field / per-frame quality record of a whole side's stacked (or dropout-corrected) TBC (fq, 2026-10-24).
 
   fq_side.py <side.tbc> <out.csv> [--vits]

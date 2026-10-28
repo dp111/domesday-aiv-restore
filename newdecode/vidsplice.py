@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Re-decode the interlaced (moving-video) frames of a newdecode MKV with the
 VIDEO model decoder (optcore.solve_fields: per-field unknowns, motion-
 compensated temporal priors, noise-weighted data term) and splice them in.
 
 newdecode.py leaves frames whose two fields differ in time (comb_score of the
 transform2d init > 0.58) as transform3d.  On the real-noise video bench
-(vbench.py, South noise spectrum) the video solver beats transform3d by about
+(South noise spectrum) the video solver beats transform3d by about
 +4.0 dB luma / +4.2 dB chroma, on every motion sequence (2026-10-13).
 
 Stages, each checkpointed in --scratch so a rerun resumes:
@@ -90,7 +91,7 @@ mini_fr = np.concatenate([np.arange(s, e + 1) for s, e in segs])          # mini
 pos = {int(f): k for k, f in enumerate(mini_fr)}
 
 # ---- prep --------------------------------------------------------------------
-from deghost import channel_inverse
+from deghost import channel_inverse, ENABLED as DEGHOST_ON
 from deherring import deherring_field
 _fd = os.open(a.tbc, os.O_RDONLY)
 def _prep(f):
@@ -99,6 +100,13 @@ def _prep(f):
     return np.clip(np.round(y), 0, 65535).astype('<u2').tobytes()
 
 mini = S('mini.tbc')
+# v6: the prep stamp records PALDEC_DEGHOST; a resume with the other setting redoes prep (and so the solve)
+DG_TAG = 'deghost=%d' % DEGHOST_ON
+if os.path.exists(S('prep.done')) and DG_TAG not in open(S('prep.done')).read():
+    log('prep.done was made with the other PALDEC_DEGHOST setting: redoing prep and solve')
+    for _n in ('prep.done', 'solve.done'):
+        if os.path.exists(S(_n)):
+            os.remove(S(_n))
 if not os.path.exists(S('prep.done')):
     t = time.time()
     with open(mini, 'wb') as w, ProcessPoolExecutor(16, mp_context=mp.get_context('fork')) as ex:
@@ -115,7 +123,7 @@ if not os.path.exists(S('prep.done')):
                             mini, S(dec + '.y4m')], stderr=subprocess.PIPE)
         if r.returncode:
             raise SystemExit(f'{dec} failed: {r.stderr[-500:]}')
-    open(S('prep.done'), 'w').write(f'{len(mini_fr)} frames in {len(segs)} segments\n')
+    open(S('prep.done'), 'w').write(f'{len(mini_fr)} frames in {len(segs)} segments {DG_TAG}\n')
     log(f'prep {len(mini_fr)} frames in {len(segs)} segments, {time.time()-t:.0f} s')
 os.close(_fd)
 
@@ -140,13 +148,11 @@ if not os.path.exists(S('solve.done')):
     inter = cand[s2 > THRESH]
     log(f'{len(inter)} interlaced frames (t2d score > {THRESH})' + (f'; newdecode reported {a.expect}' if a.expect else ''))
     np.save(S('inter.npy'), inter)
-    from noisepsd import noise_psd, noise_psd_active, combine
+    from noisepsd import estimate as noise_estimate
     # v6: noise spectrum as newdecode (PALDEC_NOISE=active: active picture after the deghost inverse, guarded by
     # the blank-line estimate; vbi = v5); measured before torch (the estimator forks)
-    if os.environ.get('PALDEC_NOISE', 'active') == 'vbi':
-        _psd = noise_psd(a.tbc, nfields=200)
-    else:
-        _psd = combine(noise_psd_active(a.tbc), noise_psd(a.tbc, nfields=200, inverse=True))[0]
+    _psd, _nmsg = noise_estimate(a.tbc, os.environ.get('PALDEC_NOISE', 'active'))
+    log(_nmsg)
     import torch, optcore as O
     # 2026-10-14 combined candidate: weights / priors / Hanover / luma roll-off from
     # optcore.decoder_config (env PALDEC_NW, PALDEC_PRIORS, PALDEC_HANOVER, PALDEC_LUMA_LPF)

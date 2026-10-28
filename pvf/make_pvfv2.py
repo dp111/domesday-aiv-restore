@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 make_pvfv2.py - build a .pvf (Pi Video File) for the Pi1MHz hardware player
 
-Supersedes make_pvf.py. Same container, same firmware; what changes is the
+Supersedes the earlier make_pvf.py (not in this repo). Same container, same firmware; what changes is the
 picture geometry and that the file now records its own pixel aspect ratio.
 
 WHY 832x576 AND NOT 768x576
@@ -63,7 +64,7 @@ USAGE
   ./make_pvfv2.py south.mkv video.pvf --width 768       # old geometry
 
 Then copy video.pvf into the /BeebVFSn directory of the SD card, install the
-full start.elf/fixup.dat and set gpu_mem=64 (see firmware/config.txt).
+full start.elf/fixup.dat and set gpu_mem=64 (see the Pi1MHz firmware's config.txt).
 Check the result with verify_pvf.py before copying gigabytes.
 
 Requires: python3, ffmpeg (with libx264) on PATH.
@@ -169,7 +170,7 @@ def build_filter(args, par, crop=None):
     """The ffmpeg filter chain: optional deinterlace, crop, scale, declared SAR.
 
     --vf replaces only the scaling part, so the deinterlacer and the SAR
-    still apply. (In make_pvf.py --vf replaced the whole chain, which made
+    still apply. (In the earlier make_pvf.py --vf replaced the whole chain, which made
     it easy to drop the scale by accident.)"""
     chain = []
     if args.deinterlace:

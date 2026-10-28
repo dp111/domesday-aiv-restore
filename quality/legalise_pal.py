@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Make a 928x576 yuv444p16le truth PAL-legal for the fq benchmark: horizontal low-pass of luma at 5.0 MHz and
 chroma at 1.3 MHz (the PAL I system bandwidths, at the 17.73 MHz 4fsc sample rate the decoders output at),
 and Y / Cb / Cr clipped to the legal 16-235 / 16-240 range.  Content beyond these is the same loss for every

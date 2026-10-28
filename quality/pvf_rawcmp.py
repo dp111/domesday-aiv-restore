@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Per-frame PSNR / SSIM of two raw yuv420p streams, frame n against frame n (fq, 2026-10-26).
 
   pvf_rawcmp.py <width> <height> <out prefix> <test command> <ref command> [--expect N]

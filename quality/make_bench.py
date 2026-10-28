@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Build a synthetic multi-capture benchmark with a known true picture (fq benchmark, 2026-10-24).
 
 For each segment of real decoded frames (the "truth", any content will do: it is the reference by
@@ -145,8 +146,8 @@ def main():
     meta = {'noise_model': npz, 'truth': mkv, 'masters': str(M['masters']), 'dx': dx, 'smear': SMEAR,
             'from': old, 'segments': []}
     if os.path.exists(f'{bench}/bench.json'):          # adding segments to an existing benchmark
-        old = json.load(open(f'{bench}/bench.json'))
-        meta['segments'] = [g for g in old['segments'] if g['dir'] not in
+        prev = json.load(open(f'{bench}/bench.json'))
+        meta['segments'] = [g for g in prev['segments'] if g['dir'] not in
                             {f'{bench}/{"pat" if src else "seg"}{st:05d}' for st, _, src in segs}]
     for s, L, src in segs:
         d = f'{bench}/{"pat" if src else "seg"}{s:05d}'

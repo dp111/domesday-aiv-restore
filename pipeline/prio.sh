@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # CPU scheduling for the pipeline (run beside run.sh).  On the i9-14900K (8 P + 16 E cores, 32 threads) the CPU is the bottleneck.
 #  - nice: stacks 5, capture ld-decodes 15 (GPU newdecode stays 0)
 #  - while a stack runs, only the V7_STACK_DECODES (2) oldest capture decodes run; the others are
@@ -20,6 +21,7 @@ setn(){ local n=$1 p t; shift
 STOPPED=                                                           # pids this scheduler has SIGSTOPped
 resume_all(){ local p; for p in $STOPPED; do kill -CONT $(tree $p) 2> /dev/null; done; STOPPED=; }
 trap 'resume_all' EXIT
+# (HUP: started under nohup, HUP is ignored and bash cannot trap it; stop the scheduler with TERM)
 trap 'v7log "prio: stopped by signal - resuming all paused processes"; exit 0' TERM INT HUP
 last=
 while :; do
@@ -34,17 +36,17 @@ while :; do
   i=0; st=
   for p in $decs; do
     i=$((i + 1))
-    if [ $i -le $keep ]; then kill -CONT $(tree $p) 2> /dev/null; else kill -STOP $(tree $p) 2> /dev/null; st="$st $p"; fi
+    if [ $i -le $keep ]; then kill -CONT $(tree $p) 2> /dev/null; else kill -STOP $(tree $p) 2> /dev/null; st="$st $p"; STOPPED="$STOPPED $p"; fi
   done
   # S: and T: are single HDDs: run one big sequential S: job at a time (dropout-correct, chunk concat), oldest first
   i=0
   # 2026-10-24: only the real ld-dropout-correct / ffmpeg processes (not shells whose command text mentions
-  # them) and only on the hard disks (V7_HDD_RE: paths on S: / T:; E: is NVMe)
-  for p in $(ps -eo pid,etimes,comm,args --sort=-etimes | awk -v hdd="${V7_HDD_RE:-/mnt/[st]/}" '$3 ~ /^ld-dropout-co/ && $0 ~ hdd {print $1} $3 == "ffmpeg" && /-f concat/ && $0 ~ hdd {print $1}'); do
-    i=$((i + 1)); if [ $i = 1 ]; then kill -CONT $p 2> /dev/null; else kill -STOP $p 2> /dev/null; st="$st io:$p"; fi
+  # them) and only on single hard disks (config V7_HDD_RE: a regex of their paths; empty = no I/O gating)
+  for p in $(ps -eo pid,etimes,comm,args --sort=-etimes | awk -v hdd="${V7_HDD_RE:-^$}" '$3 ~ /^ld-dropout-co/ && $0 ~ hdd {print $1} $3 == "ffmpeg" && /-f concat/ && $0 ~ hdd {print $1}'); do
+    i=$((i + 1)); if [ $i = 1 ]; then kill -CONT $p 2> /dev/null; else kill -STOP $p 2> /dev/null; st="$st io:$p"; STOPPED="$STOPPED $p"; fi
   done
   [ "$st" != "$last" ] && v7log "prio: keep $keep - capture decodes paused:${st:- none}"
   last=$st
-  STOPPED=$(echo "$STOPPED ${st//io:/}" | tr ' ' '\n' | awk 'NF && !s[$0]++' | while read -r p; do kill -0 "$p" 2> /dev/null && echo "$p"; done | tr '\n' ' ')
+  STOPPED=$(echo "$STOPPED" | tr ' ' '\n' | awk 'NF && !s[$0]++' | while read -r p; do kill -0 "$p" 2> /dev/null && echo "$p"; done | tr '\n' ' ')   # drop exited pids
   sleep 60 & wait $!                                                # (a signal is handled at once, not after the sleep)
 done

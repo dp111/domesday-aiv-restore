@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Stacked TBC -> chroma-decoded yuv444p16 y4m with the model-based decoder.
 
   1. de-smear the TBC (deghost.py: the channel's ~0.4 us edge smear) into a
@@ -18,11 +19,11 @@ import numpy as np, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import optcore as O, palmodel as M
 from deghost import channel_inverse, ENABLED as DEGHOST_ON
-from deherring import deherring_field
+from deherring import deherring_field, STAMP as DEHERRING_STAMP
 from concurrent.futures import ProcessPoolExecutor
-from noisepsd import noise_psd, noise_psd_active, combine as noise_combine
+from noisepsd import noise_psd, noise_psd_active, combine as noise_combine, estimate as noise_estimate
 
-# tuned on a bench with noise shaped to a real stack's spectrum (bench.py BENCH_PSD),
+# tuned on a bench with noise shaped to a real stack's spectrum,
 # with the data term weighted by 1/noise power per frequency (optcore.noise_weights)
 # 2026-10-14 combined candidate: the priors, noise weights and Hanover stage come from
 # optcore.decoder_config (env switches PALDEC_NW / PALDEC_PRIORS / PALDEC_HANOVER /
@@ -63,11 +64,17 @@ log = lambda *x: print('[newdecode]', *x, file=sys.stderr, flush=True)
 # noise_psd_active: same-phase field differences in static blocks), guarded by the blank-line estimate (also
 # after the inverse; noisepsd.combine).  The blank lines carry only the primary master (the cross-master blend works on
 # the picture), so on 3-master sides v5's estimate (PALDEC_NOISE=vbi) overstated the picture's noise and
-# with it every prior: fq benchS3 Test Card stack: true noise sigma 385-398 (flat areas), active 366, blank
+# with it every prior: fq benchmark Test Card stack: true noise sigma 385-398 (flat areas), active 366, blank
 # lines 1044 (raw 888).  The guard covers clips without static content (CAV stills only).
 _nsrc = os.environ.get('ZIP_NOISE_FROM', a.tbc)
 NOISE_MODE = os.environ.get('PALDEC_NOISE', 'active')
-if NOISE_MODE == 'vbi':
+# v6 agent 10-27 (noisepsd.estimate: spatial floor, flattened-block exclusion, temporal/spatial agreement, fallbacks);
+# PALDEC_NOISE_EST=v60 keeps v6_0's path (with PALDEC_NOISE_SFLOOR=0 PALDEC_NOISE_FLAT=0 PALDEC_NOISE_QCAP=2: exact v6_0)
+NOISE_EST = os.environ.get('PALDEC_NOISE_EST', 'v6')
+if NOISE_EST == 'v6':
+    _psd, _nmsg = noise_estimate(_nsrc, NOISE_MODE)
+    print('[newdecode] ' + _nmsg, file=sys.stderr, flush=True)
+elif NOISE_MODE == 'vbi':
     _psd = noise_psd(_nsrc, nfields=200)
 else:
     _ni = {}
@@ -77,9 +84,63 @@ else:
           % (O.noise_sigma(_pa), O.noise_sigma(_pv), O.noise_sigma(_psd), _qh, _ni), file=sys.stderr, flush=True)
 np.save(os.path.join(a.scratch, 'noise_psd.npy'), _psd)
 CFG = O.decoder_config(_psd)
+# 2026-10-28 (herring integration): the v6 estimate raises sigma where v6_0's cap held it low (City_Culture1 559 vs
+# 327), and the video solve's TEMPORAL priors scale with it: more neighbour mixing, motion ghosting 0.42 -> 0.51.
+# The video temporal priors are capped at the capped estimate's strength (PALDEC_VID_TCAP=0: off).
+import noisepsd as _np6
+if NOISE_EST == 'v6' and os.environ.get('PALDEC_VID_TCAP', '1') == '1' and _np6.LAST_CAPPED is not None:
+    _cv = O.decoder_config(_np6.LAST_CAPPED)['video']
+    _mx = float(os.environ.get('PALDEC_VID_TCAP_MIX', 1.0))   # 1: the capped strength; 0.5: geometric mean of the two
+    for _q in ('lam_t', 'lam_tc', 'lam_t4'):
+        if _q in CFG['video'] and _q in _cv and _cv[_q] < CFG['video'][_q]:
+            CFG['video'][_q] = CFG['video'][_q] ** (1 - _mx) * _cv[_q] ** _mx
+    if os.environ.get('PALDEC_FILM_TCAP', '1') == '1':
+        # the same for solve_film's temporal priors (BGB_S1 moving film: ghost 0.29 vs v6_0 0.22)
+        _cf = O.decoder_config(_np6.LAST_CAPPED)['film']
+        for _q in ('lam_t', 'lam_tc'):
+            if _q in CFG['film'] and _q in _cf:
+                CFG['film'][_q] = min(CFG['film'][_q], _cf[_q])
+    print('[newdecode] video temporal priors capped at sigma %.0f: %s' % (O.noise_sigma(_np6.LAST_CAPPED),
+          {q: round(CFG['video'][q], 4) for q in ('lam_t', 'lam_tc', 'lam_t4') if q in CFG['video']}), file=sys.stderr, flush=True)
 NOISE_W = CFG['noise_w']
+NOISE_WV = NOISE_W                      # the inline video solve's weights
+# 2026-10-27 (herring integration) region-adaptive data weight (PALDEC_NW_ADAPT=1; default OFF, see below): the in-band reference
+# trades detail against grain - p75 keeps map lines and text sharp (North panel rise x1.00 vs v6_0, min x1.03) but
+# grains flat saturated colour (South bars x1.7); min the reverse.  So the stills / film / held solves get the p75
+# weights, scaled down per pixel to the min level (data weight / sqrt(R), R = p75 / min in band) where the init's
+# luma is flat away from any edge; moving film (solve_film) and video keep the min weights.  PALDEC_NW_ADAPT=0: the global PALDEC_NW_REF.
+# 10-28: default off -- the p75 detail weight raised map error vs held-run truth (north2 held text pages: text
+# area +7.5%, paper +2.4%; the user saw more noise around map text); min weights everywhere as v6_0
+NW_ADAPT = os.environ.get('PALDEC_NW_ADAPT', '0') == '1' and O.NW_MODE == 'rec' and O.NW_NORM == 'inband'
+if NW_ADAPT:
+    _ref0 = O.NW_REF
+    O.NW_REF = 'min'; _wmin = O.noise_weights(_psd, floor=0.00625, ceil=0.025, norm=O.NW_NORM)
+    O.NW_REF = os.environ.get('PALDEC_NW_ADAPT_REF', 'p75'); _wdet = O.noise_weights(_psd, floor=0.00625, ceil=0.025, norm=O.NW_NORM)
+    O.NW_REF = _ref0
+    _fb = np.fft.rfftfreq(OW, 1 / 17.734475)
+    NW_R = float(np.median((_wdet / _wmin)[(_fb > 0.2) & (_fb < 5.0)]))
+    NOISE_W, NOISE_WV = _wdet, _wmin
+    print('[newdecode] region-adaptive data weight: detail %s, flat min (R %.2f)' % (os.environ.get('PALDEC_NW_ADAPT_REF', 'p75'), NW_R), file=sys.stderr, flush=True)
+# flat / detail thresholds on the init's smoothed luma gradient, relative to the stack's noise sigma
+NW_G0 = float(os.environ.get('PALDEC_NW_G0', 1.0)) * O.noise_sigma(_psd); NW_G1 = float(os.environ.get('PALDEC_NW_G1', 3.0)) * O.noise_sigma(_psd)
+REGION_W = {}
+NW_DIL = int(os.environ.get('PALDEC_NW_DIL', 15))     # detail-zone dilation (px, odd)
+NW_FG0 = float(os.environ.get('PALDEC_NW_FILM_G0', 4.0)) * O.noise_sigma(_psd); NW_FG1 = float(os.environ.get('PALDEC_NW_FILM_G1', 8.0)) * O.noise_sigma(_psd)
+REGION_WF = {}
+def region_weight(Y, g0=None, g1=None):
+    """(OH, OW) per-pixel data weight: 1 near detail, 1/sqrt(NW_R) in flat areas (gradient of the init's luma
+    pre-smoothed (1, 2) px, then sigma 2: below NW_G0 flat, above NW_G1 detail, both x the noise sigma; bars / map
+    paper 66-80 % flat, photos 10 %), the detail zone dilated by 7 px so thin lines / text keep it"""
+    from scipy.ndimage import gaussian_filter, maximum_filter
+    g = gaussian_filter(np.hypot(*np.gradient(gaussian_filter(Y.astype(np.float32), (1, 2)))), 2.0)
+    g0 = NW_G0 if g0 is None else g0; g1 = NW_G1 if g1 is None else g1
+    d = maximum_filter(np.clip((g - g0) / (g1 - g0), 0, 1), size=NW_DIL)
+    return (1 / np.sqrt(NW_R) + (1 - 1 / np.sqrt(NW_R)) * d).astype(np.float32)
 PARAMS.update(CFG['still']); PARAMS['hanover'] = CFG['hanover']
 FILM = dict(CFG['film'])
+_vts = float(os.environ.get('PALDEC_VID_TSCALE', 1.0))     # video temporal priors x this
+for _q in ('lam_t', 'lam_tc', 'lam_t4'):
+    if _q in CFG['video']: CFG['video'][_q] *= _vts
 if a.luma_lpf is None:
     a.luma_lpf = CFG['luma_lpf']
 log('held stills (PALDEC_HELD): %s  min run %d  T %.1f  block %d  iters %d' % (O.HELD, O.HELD_MIN, O.HELD_T, O.HELD_BLOCK, O.HELD_ITERS))
@@ -92,7 +153,8 @@ T0 = time.time()
 # build), so a retry after a failure reuses it; the stamp ties it to its source.
 dg = os.path.join(os.path.dirname(os.path.abspath(a.scratch)), 'dg_cache.tbc')
 _st = os.stat(a.tbc)
-STAMP = dict(src=os.path.abspath(a.tbc), size=_st.st_size, mtime=_st.st_mtime, start=a.start, end=end, deghost=DEGHOST_ON)
+STAMP = dict(src=os.path.abspath(a.tbc), size=_st.st_size, mtime=_st.st_mtime, start=a.start, end=end, deghost=DEGHOST_ON,
+             deherring=DEHERRING_STAMP)
 def _stamp_ok():
     try:
         return json.load(open(dg + '.stamp')) == STAMP and os.path.getsize(dg) == nfr * 2 * FSZ
@@ -172,12 +234,20 @@ def dmask(idx):
     for n, i in enumerate(idx):
         m[n, 0::2] = fmask(2 * i); m[n, 1::2] = fmask(2 * i + 1)
     return m
+def dmask_solve(idx, film=False):
+    """dmask times the region-adaptive data weight (NW_ADAPT), for the stills / held solves; film=True: the film
+    map (detail = strong line-art edges only, NW_FILM_G0/G1)"""
+    m = dmask(idx)
+    if not NW_ADAPT:
+        return m
+    r = np.stack([(REGION_WF if film else REGION_W)[i] for i in idx])
+    return r if m is None else m * r
 # v5 dropout interpolation (2026-10-24, user: "use the line before and the line afterwards"): outside held
 # stills, the masked solve's dropout pixels are replaced by (PALDEC_DOI=replace) or averaged with
 # (PALDEC_DOI=mix) a vertical interpolation of the decoded picture between the nearest clean rows above and
 # below (frame rows +-1..4 for stills / film, same-field rows +-2..8 for interlaced video).  Held stills keep
 # the solve (it fills from the run's other frames, which beats any spatial fill).  fq dofill test: see
-# /mnt/s/domsday/fq/dofill (dropout luma err 8.96 -> 8.03, never worse per segment); default replace, off = plain masked solve.
+# quality/dofill (dropout luma err 8.96 -> 8.03, never worse per segment); default replace, off = plain masked solve.
 DOI = os.environ.get('PALDEC_DOI', 'replace')
 DOI_PAD = int(os.environ.get('PALDEC_DOI_PAD', '2'))
 DOI_FB_LUMA = os.environ.get('PALDEC_DOI_FB', 'solve') == 'solve'   # v6; 'interp' = v5 (interpolate it too)
@@ -186,7 +256,7 @@ DOI_FB_LUMA = os.environ.get('PALDEC_DOI_FB', 'solve') == 'solve'   # v6; 'inter
 # pixel wherever that neighbour is clean there and locally static - box (13x33) mean |dY| and |dC| over the
 # pixels clean in both frames < PALDEC_DOT levels (8-bit; 0 = off).  fq dofill: 1.5 never worse per segment.
 # v6: the threshold is noise-relative: PALDEC_DOT x sigma / DOT_REF, sigma = the stack's picture noise (16-bit, the
-# spectrum above; DOT_REF 600 = fq benchS4's typical picture noise, where 1.5 was tuned)
+# spectrum above; DOT_REF 600 = the fq benchmark's typical picture noise, where 1.5 was tuned)
 DOT = float(os.environ.get('PALDEC_DOT', '1.5'))
 DOT_REF = float(os.environ.get('PALDEC_DOT_REF', '600'))
 DOT_T = DOT * O.noise_sigma(_psd) / DOT_REF if NOISE_MODE != 'vbi' and os.environ.get('PALDEC_DOT_ABS', '0') != '1' else DOT
@@ -222,14 +292,14 @@ json.dump(j, open(dg + '.json', 'w'))
 c = np.array(coarse); c = c - c.mean((1, 2), keepdims=True); sc = np.sqrt((c ** 2).mean((1, 2))) + 1
 corr = (c[1:] * c[:-1]).mean((1, 2)) / (sc[1:] * sc[:-1])
 same = np.concatenate([[False], corr > CORR_MIN, [False]])
-# v4 (paldec_dev/zipper3030): the coarse test above links DIFFERENT one-frame photos of similar
+# v4: the coarse test above links DIFFERENT one-frame photos of similar
 # layout (sky over ground: coarse corr 0.53-0.71) into film runs, which solve_film then mixes
 # (cross-colour checker, ghosts, lost colour; ~27% of South's coarse links).  A link must also pass
 # a shift-tolerant fine-detail correlation (field-0 luma in 2x4-sample blocks, high-passed at sigma
 # 4 blocks, Hann-windowed, max normalised xcorr over +-12 field lines / +-48 samples) >= FINE_MIN.
 # Different photos 0.02-0.39, same picture 0.59-0.999.  Frames whose fine-feature rms is below
 # FINE_EMIN (black/flat: 30-70; bars 260, photos/maps 680-2400) give no meaningful correlation:
-# their coarse link is kept.  ZIP_FINE=0 disables (= heldavg behaviour).
+# their coarse link is kept.  ZIP_FINE=0 disables (= v3 behaviour).
 FINE_MIN = float(os.environ.get('ZIP_FINE', 0.4))
 FINE_EMIN = float(os.environ.get('ZIP_FINE_EMIN', 150.))
 FINE = np.full(len(same), -1.0)
@@ -279,6 +349,10 @@ log(f'de-smear+herringbone+classify {time.time()-T0:.1f} s'); T1 = time.time()
 log(f'{nfr} frames: {video.sum()} video (transform3d), {nfr - video.sum()} stills (model decoder)')
 
 # ---- 3: starting decodes (streamed) -----------------------------------------------
+# 2026-10-27: 4 decoder threads (PALDEC_CHROMA_T; 0 = ld-chroma-decoder's default, one per CPU): output identical
+# to the default, peak memory per decoder ~14 -> ~1.8 GB on 1500 frames, still 16-26 fps against the solver's ~1.5.
+# Added here, not in the p2 / p3 lines: nd_gpuwrap.py (ND_FORCE_T3) patches the p3 line by its exact text.
+CHROMA_T = ['-t', os.environ.get('PALDEC_CHROMA_T', '4')] if os.environ.get('PALDEC_CHROMA_T', '4') != '0' else []
 class Chroma:
     """One ld-chroma-decoder y4m stream over the de-smeared TBC.  Reading the
     TBC over drvfs intermittently fails ('Could not read field data', 2026-10-12
@@ -289,7 +363,7 @@ class Chroma:
         self.start(0)
         self.header = self.hdr
     def start(self, i):
-        self.p = subprocess.Popen(['ld-chroma-decoder'] + self.args + ['-s', str(i + 1), '-p', 'y4m', '--input-json', dg + '.json', dg, '-'],
+        self.p = subprocess.Popen(['ld-chroma-decoder'] + self.args + CHROMA_T + ['-s', str(i + 1), '-p', 'y4m', '--input-json', dg + '.json', dg, '-'],
                                   stdout=subprocess.PIPE, stderr=open(os.path.join(a.scratch, 'chroma_%s.log' % self.args[1]), 'a'), bufsize=FB * 4)
         h = b''
         while not h.endswith(b'\n'):
@@ -326,11 +400,19 @@ if a.luma_lpf:
 #       solve_film over the run (temporal prior, motion-compensated)
 #   isolated stills: solve (frame mode), batched
 #   interlaced video (fields differ in time): transform3d for now
-from combscore import comb_score
+from combscore import comb_score, comb_lowsat, match_score, classify_interlaced, C_T as COMB_T
+# PALDEC_CLASSIFY=comb: the old rule (comb_score > 0.58 alone); default 'match' (combscore.classify_interlaced)
+CLASSIFY = os.environ.get('PALDEC_CLASSIFY', 'match')
+FILM2_SPLIT = float(os.environ.get('PALDEC_FILM2_SPLIT', '3.0'))
+FILM_STATIC_M = float(os.environ.get('PALDEC_FILM_STATIC_M', '0.2'))   # held stills 0.05-0.2 (bars 0.5), motion >= 0.7
+NW_FILM_LINEART = os.environ.get('PALDEC_NW_FILM_LINEART', '1') == '1'
+HELD_LOCAL_VIDEO = os.environ.get('PALDEC_HELD_LOCAL_VIDEO', '1') == '1'   # local-motion runs -> per-field video solve
+LOCAL_HELD = os.environ.get('PALDEC_LOCAL_HELD', '1') == '1'               # ... then held-averaged (static background)
+LOCAL_HELD_T = float(os.environ.get('PALDEC_LOCAL_HELD_T', 1.0))            # its outlier threshold x this
 WIN, RUNCH, VCHUNK = 64, 8, 8      # VCHUNK 8 (vidsplice: 12): W5 + Hanover at 10 frames peaks ~2.6 GB
 out = sys.stdout.buffer if a.out == '-' else open(a.out, 'wb')
 out.write(H2)
-# explicit positional reads, not np.memmap: on drvfs (/mnt/s) memmap page faults go
+# explicit positional reads, not np.memmap: on drvfs (WSL) memmap page faults go
 # through 9P and, alongside two ld-chroma-decoders reading the same file, the
 # decoders intermittently failed with 'Could not read field data' (2026-10-12)
 _dgfd = os.open(dg, os.O_RDONLY)
@@ -351,13 +433,26 @@ def setups(idx):
 # Ratio = mean smoothed |C| of the solve / of its transform3d init over pixels where the init's
 # |C| > 6 (8-bit); real video 0.92-0.93.  Below SAT_MIN the frame keeps transform3d.  Every
 # video-solved frame is logged to <scratch>/satratio.txt (frame ratio fellback).  ZIP_SATGUARD=0 disables.
-SAT_MIN = float(os.environ.get('ZIP_SATGUARD', 0.88))
+SAT_MIN = float(os.environ.get('ZIP_SATGUARD', 0.6))   # 10-28: 0.88 -> 0.6: real video solves read 0.6-0.87 on NationalB / City_Culture (low-chroma scenes, t3d cross-colour), so 0.88 sent ~all of them back to transform3d (motion combing x1.5); the drained map zoom read 0.33
 SATLOG = open(os.path.join(a.scratch, 'satratio.txt'), 'a')
 def _satratio(x, init):
     from scipy.ndimage import uniform_filter as _uf
     def mag(z): return np.hypot(_uf(z[1] - 32768, 5), _uf(z[2] - 32768, 5))
-    m0 = mag(init); m = m0 > 6 * 256
+    m0 = mag(init); m = m0 > SAT_C * 256
     return float(mag(x)[m].mean() / m0[m].mean()) if m.sum() > 1000 else 1.0
+SAT_C = float(os.environ.get('PALDEC_SATGUARD_C', 6))   # init chroma (8-bit) that the guard tests
+GHOST_MAX = float(os.environ.get('PALDEC_GHOST_MAX', 0.3))    # video-solve lean toward its neighbours; 0 = off
+GHOST_GAIN = float(os.environ.get('PALDEC_GHOST_GAIN', 0.10))  # ... kept anyway when t3d would comb > this much more
+GH_S2 = (O.noise_sigma(_psd) * float(os.environ.get('PALDEC_GHOST_SK', 1.0))) ** 2      # t2d luma noise variance (approx.)
+def _ghost_coef(Yd, Yk, Yp, Yn):
+    """lean of the solve toward its neighbours, less the part a pure denoise of Yk's own noise gives
+    (E[(out - Yk) N] = sigma^2 per pixel when out removes Yk's noise: sigma^2 / mean(N^2))"""
+    N = 0.5 * (Yp.astype(np.float64) + Yn) - Yk
+    n2 = float((N * N).mean())
+    if np.sqrt(n2) < 1000:                       # neighbours ~ this frame (still / noise only): no lean to measure
+        return 0.0
+    g = float(((Yd.astype(np.float64) - Yk) * N).mean() / n2)
+    return g - GH_S2 / n2
 
 
 def decode_window(i0, F2, F3):
@@ -365,7 +460,26 @@ def decode_window(i0, F2, F3):
     idx = sorted(F2)
     res = {}
     held = set(); fbf = set()
-    inter = {i: comb_score(F2[i][0]) > 0.58 for i in idx}   # combscore: static <=0.50
+    if NW_ADAPT:
+        REGION_W.clear(); REGION_W.update({i: region_weight(F2[i][0]) for i in idx})
+        REGION_WF.clear(); REGION_WF.update({i: region_weight(F2[i][0], NW_FG0, NW_FG1) for i in idx})
+        stats['nw_flat_sum'] = stats.get('nw_flat_sum', 0) + round(float(sum((w < 0.99).mean() for w in REGION_W.values())), 1)
+    cs = np.array([comb_score(F2[i][0]) for i in idx])   # combscore: static <=0.50
+    if CLASSIFY == 'comb':
+        inter = {i: bool(c > COMB_T) for i, c in zip(idx, cs)}
+    else:
+        # static frames that only LOOK combed (saturated colour, menus, text pages, bars) match their same-scene
+        # neighbour to noise; real interlaced motion does not (combscore.classify_interlaced)
+        link = np.array([k > 0 and bool(same[i]) and idx[k - 1] == i - 1 for k, i in enumerate(idx)])
+        mm = np.full(len(idx), np.inf)
+        for k, i in enumerate(idx):
+            if cs[k] > COMB_T:
+                if link[k]: mm[k] = min(mm[k], match_score(F2[i][0], F2[i - 1][0]))
+                if k + 1 < len(idx) and link[k + 1]: mm[k] = min(mm[k], match_score(F2[i][0], F2[i + 1][0]))
+        cl = np.array([comb_lowsat(F2[i]) if cs[k] > COMB_T else np.nan for k, i in enumerate(idx)])
+        iv = classify_interlaced(cs, mm, link, cl)
+        inter = {i: bool(v) for i, v in zip(idx, iv)}
+        stats['comb_still'] = stats.get('comb_still', 0) + int(((cs > COMB_T) & ~iv).sum())
     # runs of single-instant frames linked by same-scene correlation
     runs, cur = [], []
     vids = []
@@ -381,14 +495,27 @@ def decode_window(i0, F2, F3):
             if cur: runs.append(cur)
             cur = [i]
     if cur: runs.append(cur)
+    # 2026-10-27 (herring integration): a 2-frame film run of two DIFFERENT pictures (consecutive satellite photos of
+    # similar layout pass the coarse and fine link tests: North 16395/16396, match 4.8) is split into two stills:
+    # solve_film's temporal prior mixes them and leaves the subcarrier in luma (hatch x10, lost saturation).  Film
+    # frames of real motion match 1.2-2.3; PALDEC_FILM2_SPLIT=0 disables.
+    if FILM2_SPLIT > 0:
+        sp = []
+        for r in runs:
+            if len(r) == 2 and match_score(F2[r[1]][0], F2[r[0]][0]) > FILM2_SPLIT:
+                sp += [[r[0]], [r[1]]]; stats['film2_split'] = stats.get('film2_split', 0) + 1
+            else:
+                sp.append(r)
+        runs = sp
     singles = [r[0] for r in runs if len(r) == 1]
     t = time.time()
     for k in range(0, len(singles), BATCH):
         b = singles[k:k + BATCH]
         C, cu, cv = setups(b)
-        o = O.solve(C, cu, cv, np.stack([F2[i] for i in b]), noise_w=NOISE_W, dmask=dmask(b), **PARAMS)
+        o = O.solve(C, cu, cv, np.stack([F2[i] for i in b]), noise_w=NOISE_W, dmask=dmask_solve(b), **PARAMS)
         for i, x in zip(b, o): res[i] = x
         stats['still'] += len(b)
+    local_runs = []; film_res = {}
     for r in (r for r in runs if len(r) > 1):
         for k in range(0, len(r), RUNCH):
             core = r[k:k + RUNCH]
@@ -396,23 +523,51 @@ def decode_window(i0, F2, F3):
             C, cu, cv = setups(ctx)
             I = np.stack([(F3 or F2)[i] if (F3 and video[i]) else F2[i] for i in ctx])
             fl = O.estimate_flow_gpu(I[:, 0], lag=1)
-            o = O.solve_film(C, cu, cv, I, fl, noise_w=NOISE_W, hanover=PARAMS['hanover'], dmask=dmask(ctx), **FILM)
+            # region-adaptive weights for static runs only: on MOVING film the p75 detail weight keeps line structure
+            # that reads as combing (quickcheck suite EcoDisc / BGB / NationalB motion: 1.25-1.33 x v6_0), while static
+            # film runs (maps, text, bars that held_static did not take) need it for their detail (NationalA / BGB maps
+            # rise 1.10-1.12 x with the min weights).  Static: median frame-to-frame match_score of the inits < FILM_STATIC_M.
+            st = NW_ADAPT and np.median([match_score(F2[ctx[q + 1]][0], F2[ctx[q]][0]) for q in range(len(ctx) - 1)]) < FILM_STATIC_M
+            stats['film_static' if st else 'film_moving'] = stats.get('film_static' if st else 'film_moving', 0) + len(core)
+            # moving film: the p75 detail weight only on strong line-art edges (maps / text / graphics: line contrast
+            # far above any natural texture), elsewhere the min level (natural moving texture read as combing)
+            fw = NW_ADAPT and NW_FILM_LINEART
+            o = O.solve_film(C, cu, cv, I, fl, noise_w=NOISE_W if (st or fw) else NOISE_WV, hanover=PARAMS['hanover'],
+                             dmask=dmask_solve(ctx) if st else dmask_solve(ctx, film=True) if fw else dmask(ctx), **FILM)
             for i, x in zip(ctx, o):
                 if i in core: res[i] = x
             stats['film'] += len(core)
         if O.HELD and len(r) >= O.HELD_MIN:
-            # held still (paldec_dev/heldavg): one shared latent over the whole static run
+            # held still: one shared latent over the whole static run
             # (within this window), per-frame outlier blocks keep their own solution
-            if O.held_static(np.stack([res[i][0] for i in r])):
+            hs = O.held_static(np.stack([res[i][0] for i in r]))
+            print(f"[newdecode] held? {r[0]}-{r[-1]} flow {O.HELD_DEBUG['flow']:.3f} drift {O.HELD_DEBUG['drift']:.2f} movfrac {O.HELD_DEBUG['movfrac']:.3f} -> {'held' if hs else 'moving'}", file=sys.stderr)
+            if hs:
                 C, cu, cv = setups(r)
-                o = O.solve_held(C, cu, cv, np.stack([res[i] for i in r]), NOISE_W, PARAMS, hanover=PARAMS['hanover'], dmask=dmask(r))
+                o = O.solve_held(C, cu, cv, np.stack([res[i] for i in r]), NOISE_W, PARAMS, hanover=PARAMS['hanover'], dmask=dmask_solve(r))
                 del C, cu, cv
                 for i, x in zip(r, o): res[i] = x
                 held.update(r)
                 stats['held'] = stats.get('held', 0) + len(r)
                 stats['held_out'] = stats.get('held_out', 0) + O.HELD_DEBUG['outblocks']
+                print(f"[newdecode] held {r[0]}-{r[-1]} outblocks {O.HELD_DEBUG['outblocks']}", file=sys.stderr)
+            elif (HELD_LOCAL_VIDEO and a.video and F3 and O.HELD_DEBUG['flow'] < O.HELD_FLOW
+                  and O.HELD_MOVFRAC > 0 and O.HELD_DEBUG['movfrac'] >= O.HELD_MOVFRAC):
+                # local motion on a still background (NationalB 69442 inset of moving people, talking heads): the
+                # frame-level classifier sees a still (comb score of the whole frame) and weaves it, but the moving
+                # region is interlaced video -> combing (NationalB_v2 0.254 film / 0.225 held vs v6_0 0.187, which
+                # averages the motion away: ghost 0.77).  Solved per field as video: combing 0.199, ghost 0.53.
+                # The still background is then averaged over the run from those per-field solutions (solve_held:
+                # its outlier blocks, the moving region, keep each frame's own video solution): Countryside talking-
+                # head insets, all-video flat grain 183 vs v6_0's averaged 117.
+                for i in r:
+                    film_res[i] = res[i]; res[i] = F3[i]; vids.append(i); inter[i] = True
+                stats['film'] -= len(r); stats['interlaced'] += len(r)
+                stats['local_video'] = stats.get('local_video', 0) + len(r)
+                local_runs.append(r)
             else:
                 stats['held_moving'] = stats.get('held_moving', 0) + len(r)
+    vids.sort()
     if a.video and vids and F3:
         # interlaced video: per-field solve (as vidsplice.py), runs of consecutive frames in
         # chunks of VCHUNK with one context frame each side (inside this window)
@@ -434,16 +589,36 @@ def decode_window(i0, F2, F3):
                 C, cu, cv = O.field_setup(tb, range(len(tb)))
                 I = np.array([F3[kk][:, p::2] for kk in ks for p in (0, 1)])
                 fl = O.estimate_flow_gpu(I[:, 0], lag=2)
-                o = O.solve_fields(C, cu, cv, I, [p for _ in ks for p in (0, 1)], flow=fl, noise_w=NOISE_W,
+                o = O.solve_fields(C, cu, cv, I, [p for _ in ks for p in (0, 1)], flow=fl, noise_w=NOISE_WV,
                                    hanover=CFG['hanover_video'], lr=1e4, **CFG['video'],
                                    dmask=np.array([fmask(2 * kk + p) for kk in ks for p in (0, 1)]) if vmask else None)
                 for c, kk in enumerate(ks):
                     if kk in core:
                         x = np.empty((3, OH, OW), np.float32); x[:, 0::2] = o[2 * c]; x[:, 1::2] = o[2 * c + 1]
-                        ratio = _satratio(x, F3[kk]); fb = ratio < SAT_MIN
-                        SATLOG.write('%d %.3f %d\n' % (a.start + kk, ratio, fb)); SATLOG.flush()
+                        ratio = _satratio(x, F3[kk]); fb = ratio < SAT_MIN; sat_fb = fb
+                        # 10-28 ghost guard: a video solve whose luma leans toward the neighbouring frames (its
+                        # temporal priors mixed them in) keeps transform3d, as the 0.88 guard did by accident
+                        # (UN_v3 motion ghost 0.45 vs v6_0 -0.03).  Lean as quickcheck's ghost_coef, vs the t2d inits.
+                        if not fb and GHOST_MAX > 0 and kk - 1 in F2 and kk + 1 in F2:
+                            gc = _ghost_coef(x[0], F2[kk][0], F2[kk - 1][0], F2[kk + 1][0])
+                            if os.environ.get('PALDEC_GHOST_LOG'):
+                                print('[newdecode] glog %d lean %.3f comb_solve %.3f comb_t3d %.3f comb_t2d %.3f' % (kk, gc,
+                                      comb_score(x[0]), comb_score(F3[kk][0]), comb_score(F2[kk][0])), file=sys.stderr)
+                            # lesser artefact: transform3d only where the solve leans (ghost) AND buys little against
+                            # combing (comb_score of t3d over the solve's < 1 + GHOST_GAIN): UN 24-30 lean 0.45, gain 1-9 %
+                            # -> t3d; City_Culture1 lean 0.44, gain 25 % / City_Financial1 0.52, 15 % -> solve
+                            if gc > GHOST_MAX and GHOST_GAIN > 0:
+                                cs_s = comb_score(x[0]); cs_t = comb_score(F3[kk][0])
+                                if cs_t > cs_s * (1 + GHOST_GAIN): gc = 0.0
+                            if gc > GHOST_MAX:
+                                fb = True; stats['ghost_fallback'] = stats.get('ghost_fallback', 0) + 1
+                                print('[newdecode] ghost guard frame %d lean %.2f -> transform3d' % (kk, gc), file=sys.stderr)
+                        # satratio.txt / sat_fallback record the saturation guard only; ghost fallbacks are counted
+                        # in stats['ghost_fallback'] (quality DB nd table must not mislabel them)
+                        SATLOG.write('%d %.3f %d\n' % (a.start + kk, ratio, sat_fb)); SATLOG.flush()
+                        if sat_fb: print('[newdecode] satguard frame %d ratio %.3f -> transform3d' % (kk, ratio), file=sys.stderr)
+                        if sat_fb: stats['sat_fallback'] += 1
                         if fb:
-                            stats['sat_fallback'] += 1
                             if vmask and (2 * kk in DO or 2 * kk + 1 in DO):
                                 # v5: transform3d's dropout pixels are line copies; keep the masked solve's luma there
                                 # (its chroma is what failed the guard: synthetic test luma err 9.3 -> 4.4, chroma 1.7 -> 2.0)
@@ -454,6 +629,25 @@ def decode_window(i0, F2, F3):
                                 x = F3[kk]
                         res[kk] = x
                 stats['video_solved'] = stats.get('video_solved', 0) + len(core)
+    if LOCAL_HELD:
+        for r in local_runs:
+            if all(res[i] is F3[i] for i in r):          # no video solve ran for this run
+                continue
+            C, cu, cv = setups(r)
+            _t = O.HELD_T; O.HELD_T = _t * LOCAL_HELD_T      # per-field solutions are noisier than film ones
+            try:
+                # the static background averaged from the FILM solutions (independent per frame: the video solve's
+                # temporal priors correlate its frames, Countryside 27826 grain 155 vs 109); the moving blocks
+                # (outliers) take the per-field video solutions
+                o = O.solve_held(C, cu, cv, np.stack([film_res[i] for i in r]), NOISE_W, PARAMS, hanover=PARAMS['hanover'],
+                                 dmask=dmask(r), own=np.stack([res[i] for i in r]))
+            finally:
+                O.HELD_T = _t
+            del C, cu, cv
+            for i, x in zip(r, o): res[i] = x
+            held.update(r)
+            stats['local_held'] = stats.get('local_held', 0) + len(r)
+            print(f"[newdecode] local-motion held {r[0]}-{r[-1]} outblocks {O.HELD_DEBUG['outblocks']}", file=sys.stderr)
     if a.dropout_mask and DOI in ('replace', 'mix'):
         for i in idx:
             if i in held or not (2 * i in DO or 2 * i + 1 in DO):
@@ -492,7 +686,8 @@ def decode_window(i0, F2, F3):
         cls = {i: ('inter' if inter[i] else 'single') for i in idx}
         for r in runs:
             if len(r) > 1:
-                for i in r: cls[i] = 'film%d' % len(r)
+                for i in r:
+                    if not inter[i]: cls[i] = 'film%d' % len(r)
         with open(os.environ['ZIP_DUMP'], 'a') as fh:
             for i in idx: fh.write('%d %s video=%d same=%d fine=%.3f\n' % (a.start + i, cls[i], video[i], same[i], FINE[i]))
     return res
@@ -503,7 +698,8 @@ def decode_window(i0, F2, F3):
 # (South: 8 single-frame fragments).  A run crossing w0+WIN is taken whole when it ends by w0+WIN_MAX, else
 # the window ends where it starts (if that leaves >= WIN/4 frames), else it is split at w0+WIN (pieces >= 16).
 # PALDEC_WIN_MAX=64 restores v5.
-WIN_MAX = int(os.environ.get('PALDEC_WIN_MAX', 96))
+# v6 agent 10-27: 80 (a 96-frame held window peaked at 5.3 GB GPU, 64: 3.2; 80 still leaves no piece shorter than 16)
+WIN_MAX = int(os.environ.get('PALDEC_WIN_MAX', 80))
 def window_end(w0):
     e = min(nfr, w0 + WIN)
     if e == nfr or not same[e] or WIN_MAX <= WIN:

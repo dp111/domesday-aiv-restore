@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Exact PAL forward model for ld-decode 4fsc TBC fields.
 
 The TBC is subcarrier-locked: with k the sample index and l the field line,

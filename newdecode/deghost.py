@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Remove the record/playback channel's slow edge smear ("ghost to the right").
 
 Every edge on the disc - the VITS bar (both directions) and the sync rising

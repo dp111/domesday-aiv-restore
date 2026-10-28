@@ -1,18 +1,24 @@
 #!/bin/bash
-# Chunked newdecode (2026-10-18, generalised 2026-10-19 from nd_chunked_north.sh).
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Chunked newdecode (2026-10-18, generalised 2026-10-19 from the first, North-only version).
 #   nd_chunked.sh <side> <scratch dir with doc.tbc> <audio pcm> [tag v6]  -> $V7_OUT/<side>.<tag>.mkv
-# Origin: The v5 chain decoded the side in one 5.5 h run and threw
+# Origin: the earlier chain decoded the side in one 5.5 h run and threw
 # the partial output away on a failure; North died twice on GPU errors (19:31 CUDA OOM at frame
 # 29824, 19:54 cuFFT internal error at frame 832). User: "why can't you continue from just before
 # the crash?"
-# Each chunk of 5120 frames (a multiple of newdecode's 64-frame window) is decoded with 64 frames of
-# lead-in/out, trimmed to its own range and kept as ndc/chunk_NN.mkv; a finished chunk is reused, so
-# a crash costs one chunk. Test 2026-10-18 (frames 896-1216 vs 960-1216): only the first 8 frames
-# after a run start differ materially; elsewhere run-to-run GPU noise (max ~1 8-bit level).
+# Each chunk of 5120 frames is decoded with 64 frames of lead-in/out (newdecode's windows, 64 frames or
+# up to PALDEC_WIN_MAX when that ends them at a run boundary, restart in every chunk), trimmed to its
+# own range and kept as ndc/chunk_NN.mkv; a finished chunk is reused, so a crash costs one chunk.
+# Test 2026-10-18 (frames 896-1216 vs 960-1216): only the first 8 frames after a run start differ
+# materially; elsewhere run-to-run GPU noise (max ~1 8-bit level).
 # newdecode runs under nd_gpuwrap.py (frees the PyTorch GPU cache before cuFFT flow; see there).
 # Then: concat + audio -> $V7_OUT/<side>.<tag>.mkv, a decode log with a summed done line and satratio.
-# The chunks are tied to the doc.tbc they came from ($C/doc.id: its size + mtime); a new doc.tbc (restack)
-# discards them, and chunks without that stamp are kept only if newer than doc.tbc.
+# The chunks are tied to what made them ($C/doc.id: doc.tbc size + mtime, the decoder directory, md5 of its
+# newdecode.py + optcore.py, ND_EXTRA); any change, or chunks without that stamp, discards them, so a
+# restack, decoder switch or option change never gives a mixed-decoder master.
+# Decoder: ND_CD, else ND_DIR (config.sh); a directory named in $WORK/state/ND_CD overrides both, so side
+# chains already running switch decoder at their next newdecode.  The decoder used is recorded in
+# $V7_OUT/<side>_<tag>_decoder.txt ("<dir> <md5>") for the quality record.
 # GPU exclusivity is atomic: the chunk loop holds an exclusive flock on $ND_GPULOCK ($WORK/state/gpu.lock),
 # inherited by newdecode, so two sides cannot both start a newdecode inside gpugate.sh's polling window;
 # it is released before the concat, so the next side's decode overlaps that.
@@ -21,7 +27,8 @@ set -o pipefail
 S=$1 SCR=$2 APCM=$3 TAG=${4:-v6}
 B=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$B/../config.sh"
-CD=${ND_CD:-$DAR/newdecode}   # ND_EXTRA="--dropout_mask 1": newdecode/README_dropout.txt
+CD=${ND_CD:-$ND_DIR}   # ND_EXTRA="--dropout_mask 1": newdecode/README_dropout.txt
+[ -s "$WORK/state/ND_CD" ] && CD=$(cat "$WORK/state/ND_CD")
 OUT=$V7_OUT
 C=$SCR/ndc
 LOG=${ND_LOG:-$WORK/pipeline.log}
@@ -43,14 +50,11 @@ nframes(){ ffprobe -v error -count_packets -select_streams v:0 -show_entries str
 mkdir -p "$C"
 N=$(( $(stat -c %s "$SCR/doc.tbc") / (1135 * 313 * 2 * 2) ))
 NC=$(( (N + CH - 1) / CH ))
-DID=$(stat -c '%s %Y' "$SCR/doc.tbc")
-if [ -s "$C/doc.id" ] && [ "$(cat "$C/doc.id")" != "$DID" ]; then
-  log "chunked newdecode $S: doc.tbc changed since the chunks were made - discarding them"
+NDMD5=$(cat "$CD/newdecode.py" "$CD/optcore.py" 2>/dev/null | md5sum | cut -c1-12)
+DID="$(stat -c '%s %Y' "$SCR/doc.tbc") $CD $NDMD5 ${ND_EXTRA:-}"
+if [ "$(cat "$C/doc.id" 2>/dev/null)" != "$DID" ] && ls "$C"/chunk_*.mkv > /dev/null 2>&1; then
+  log "chunked newdecode $S: doc.tbc, decoder or ND_EXTRA changed since the chunks were made (or no stamp) - discarding them"
   rm -rf "$C"/chunk_* "$C"/sat_*.txt "$C"/cls_*.txt "$C"/w[0-9]*
-elif [ ! -s "$C/doc.id" ]; then
-  for m in "$C"/chunk_*.mkv; do
-    [ -e "$m" ] && [ "$m" -ot "$SCR/doc.tbc" ] && { K=${m##*/chunk_}; K=${K%.mkv}; rm -f "$m" "$C/chunk_$K.log" "$C/sat_$K.txt" "$C/cls_$K.txt"; log "chunk $K older than doc.tbc - discarded"; }
-  done
 fi
 echo "$DID" > "$C/doc.id"
 log "chunked newdecode $S: $N frames in $NC chunks of $CH (+-$PAD lead) -> $C (decoder $CD ${ND_EXTRA:-})"
@@ -91,6 +95,7 @@ ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "$C/list.txt" -f s16
     -map 0:v -map 1:a -c:v copy -c:a flac "$MKV.tmp.mkv" || die "concat failed"
 [ "$(nframes "$MKV.tmp.mkv")" = $N ] || die "concat has $(nframes "$MKV.tmp.mkv") frames, want $N"
 mv -f "$MKV.tmp.mkv" "$MKV"
+echo "$CD $NDMD5" > "$OUT/${S}_${TAG}_decoder.txt"
 cat "$C"/sat_*.txt > "$OUT/${S}_${TAG}_satratio.txt"
 cat "$C"/cls_*.txt > "$OUT/${S}_${TAG}_classes.txt" 2>/dev/null || :
 # decode log for the chain: the chunk logs + one done line with stats summed over chunks (incl. lead frames)

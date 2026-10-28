@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Dropout-fill comparison through newdecode (see prep.py).  A copy/no mask, B interp/no mask,
 # C copy/mask (production), D interp/mask.
 #   run.sh <benchdir>  (a make_bench.py benchmark)

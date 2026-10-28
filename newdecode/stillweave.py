@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Per-frame weave / deinterlace of a chroma-decoded MKV, for the PVF.
 
 bwdif decides per pixel whether something moved by looking at the
@@ -26,12 +27,15 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from combscore import comb_score
 
+SCORE_THREADS = int(os.environ.get('STILLWEAVE_THREADS', '6'))
 THRESH = 0.58     # noise-aware score: static 0.39-0.50 (incl. colour bars); 2 px inter-field motion 0.60-1.24
 
 ap = argparse.ArgumentParser()
 ap.add_argument('input'); ap.add_argument('--start', type=float, default=None)
 ap.add_argument('--frames', type=int, default=None); ap.add_argument('--log', default=None)
 ap.add_argument('--expect-frames', type=int, default=None)
+ap.add_argument('--classes', default=None, help="newdecode's per-frame class log (ZIP_DUMP: '<frame> <class> ...'): every frame "
+                "newdecode solved as one instant (single / film / held) is woven; only its 'inter' frames use the score")
 ap.add_argument('--width', type=int, default=928); ap.add_argument('--height', type=int, default=576)
 a = ap.parse_args()
 W, H = a.width, a.height
@@ -54,6 +58,16 @@ def reader(vf):
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=FB * 2)
 
 
+# 2026-10-27 (herring integration): the score alone sends static saturated colour, menus and text pages (0.58-0.62 on the
+# model decoder's output) to bwdif; with --classes the decoder's own still / interlaced decision is used
+CLS = {}
+if a.classes:
+    for ln in open(a.classes):
+        p = ln.split()
+        if len(p) >= 2 and p[0].lstrip('-').isdigit():
+            CLS[int(p[0])] = p[1]
+first = int(round((a.start or 0) * 25))
+
 raw = reader(None)
 bw = reader('bwdif=mode=0:parity=0')
 out = sys.stdout.buffer
@@ -62,19 +76,37 @@ n = nd = 0
 err = None
 try:
     out.write(f'YUV4MPEG2 W{W} H{H} F25:1 Ip A259:311 C444p16 XCOLORRANGE=LIMITED\n'.encode())
+    # comb_score is per frame and releases the GIL in numpy/scipy, so it runs on a pool a few frames
+    # ahead of the writer (in order); single-threaded it was the PVF build's bottleneck
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(SCORE_THREADS); q = deque()
+    def frames():
+        global err
+        while True:
+            fr = raw.stdout.read(FB); fb = bw.stdout.read(FB)
+            if len(fr) < FB or len(fb) < FB:
+                if fr or fb:
+                    err = f'readers ended unevenly at frame {n + len(q)} ({len(fr)} / {len(fb)} of {FB} bytes)'
+                return
+            yield fr, fb
+    src = frames()
     while True:
-        fr = raw.stdout.read(FB); fb = bw.stdout.read(FB)
-        if len(fr) < FB or len(fb) < FB:
-            if fr or fb:
-                err = f'readers ended unevenly at frame {n} ({len(fr)} / {len(fb)} of {FB} bytes)'
+        for fr, fb in src:
+            q.append((fr, fb, pool.submit(comb_score, np.frombuffer(fr, '<u2', count=W * H).reshape(H, W))))
+            if len(q) >= 2 * SCORE_THREADS:
+                break
+        if not q:
             break
-        Y = np.frombuffer(fr, '<u2', count=W * H).reshape(H, W)
-        s = comb_score(Y)
-        use = fb if s > THRESH else fr
-        nd += s > THRESH
+        fr, fb, fu = q.popleft()
+        s = fu.result()
+        c = CLS.get(first + n)
+        deint = (s > THRESH) if c is None or c == 'inter' else False
+        use = fb if deint else fr
+        nd += deint
         out.write(b'FRAME\n'); out.write(use)
         if log:
-            log.write(f'{n} {s:.3f} {"deint" if s > THRESH else "weave"}\n')
+            log.write(f'{n} {s:.3f} {"deint" if deint else "weave"}{" " + c if c else ""}\n')
         n += 1
     out.flush()
 except BaseException:

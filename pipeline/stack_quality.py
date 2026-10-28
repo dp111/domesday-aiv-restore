@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Predicted noise of a stack from its stack.py log.
 
 stack.py measures each capture's noise as its deviation from the cross-capture

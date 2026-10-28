@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Example config.local.sh: the machine the 2026 restoration ran on (WSL2, i9-14900K, 48 GB, one GPU).
 # S: and T: are single hard disks, E: is NVMe (it also holds the .ldf captures, so decodes go to a
 # scratch directory beside them, never into the capture directories).
@@ -13,3 +14,5 @@ V7_DRIVES="/mnt/s/domsday/v7_scratch/work:/mnt/s:600 /mnt/e/domsday_scratch/v7wo
 CAP_AIV=/mnt/e/domesday
 CAP_DISCS=/mnt/s
 CAP_UN=/root/v7links
+V7_HDD_RE=/mnt/[st]/                # S: and T: are hard disks
+ND_GPULOCK=/run/lock/aiv-gpu.lock      # shared by every WORK dir on this machine (one GPU)

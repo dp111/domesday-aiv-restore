@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Motion-adaptive temporal dropout fill, offline on a newdecode output (user 2026-10-25: "if that part of the
 frame doesn't move we can use the previous and next frame").
   temporal.py <label> T1 [T2 ...]     (thresholds in 8-bit levels of local mean |dY| around the dropout)
@@ -7,7 +8,7 @@ neighbour is locally static (box-averaged |dY| over clean pixels < T) and clean 
 """
 import os, sys, numpy as np
 from scipy.ndimage import binary_dilation, uniform_filter
-B = os.environ.get('FQ_BENCH', 'benchS3'); FW, FH = 928, 576
+B = os.environ.get('FQ_BENCH') or sys.exit('set FQ_BENCH=<make_bench.py benchmark dir>'); FW, FH = 928, 576
 SEGS = ['seg03000', 'seg08000', 'seg16256', 'seg29696', 'seg50112', 'pat40000']
 lab = sys.argv[1]; TS = [float(t) for t in sys.argv[2:]]
 BY, BX = 13, 33

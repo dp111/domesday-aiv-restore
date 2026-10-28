@@ -1,8 +1,10 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # GPU / memory gate for the pipeline (run beside run.sh).  A side holds its GPU lock through the concat +
 # ffprobe verify of its ~100 GB MKV, which took 9 h on a busy HDD while the GPU sat idle.  So both GPU
 # lock slots are usable, and this gate keeps it to one newdecode at a time (each peaks ~32 GB):
-# PAUSE_gpu (honoured by acquire) while an nd_gpuwrap runs or a gpu lock was taken in the last 5 minutes
+# PAUSE_gpu.auto (honoured by acquire, like a manual PAUSE_gpu) while an nd_gpuwrap runs or a gpu lock
+# was taken in the last 5 minutes
 # (its newdecode may not have started yet).
 # This gate polls (10 s), so two sides could still both start a newdecode inside one window; the
 # exclusivity itself is atomic: nd_chunked.sh holds an exclusive flock on $ND_GPULOCK ($WORK/state/gpu.lock)
@@ -22,7 +24,8 @@ while :; do
   done
   # 2026-10-23: also hold new stacks (16 jobs, many GB) while a newdecode runs: NationalB + Countryside_S1 stacks
   # beside North filled RAM + swap (ENOMEM in North, South PVF, capture decodes)
-  if [ -n "$busy" ]; then touch "$V7/PAUSE_gpu" "$V7/PAUSE_stack"; else rm -f "$V7/PAUSE_gpu" "$V7/PAUSE_stack"; fi
+  # (its own PAUSE_*.auto files; a manual PAUSE_gpu / PAUSE_stack is left alone)
+  if [ -n "$busy" ]; then touch "$V7/PAUSE_gpu.auto" "$V7/PAUSE_stack.auto"; else rm -f "$V7/PAUSE_gpu.auto" "$V7/PAUSE_stack.auto"; fi
   [ "$busy" != "$last" ] && v7log "gpugate: ${busy:-GPU free}"
   last=$busy
   # 2026-10-23: a lock whose owner process is gone (South's PVF rebuild died holding pvf.1; North's PVF waited 7.5 h)

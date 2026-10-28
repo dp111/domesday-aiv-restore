@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Run the production stack -> dropout-correct -> newdecode chain on an fq benchmark (make_bench.py output).
 #   run_bench.sh <benchdir> <label> [caps...]
 # Output per segment: <seg>/<label>/{stack.tbc,doc.tbc,out.yuv,*.log}; then score.py scores it.

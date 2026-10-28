@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Measure the real disc + player noise model of a side from per-capture TBC segments (fq benchmark).
 
 Uses the blank vertical-interval lines (field rows 5-14 and 20-21: flat black, no VITS / VBI data), on
