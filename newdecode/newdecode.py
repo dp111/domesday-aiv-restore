@@ -391,9 +391,27 @@ p2 = Chroma(['-f', 'transform2d', '--transform-threshold', '0.7'])
 p3 = Chroma(['-f', 'transform3d']) if video.any() else None
 H2 = p2.header
 
+_lp = None
 if a.luma_lpf:
     _f = np.fft.rfftfreq(OW, 1 / 17.734475)
     _lp = (0.5 + 0.5 * np.cos(np.pi * np.clip((_f - (a.luma_lpf - 0.4)) / 0.8, 0, 1))).astype(np.float32)
+# v6_3 (2026-10-31): luma equaliser from the TBC's own multiburst VITS (lumaeq.py): the deghost inverse lifts luma
+# above ~1 MHz by up to 1.18 while the real record/playback chain is much flatter than its smear model (South after
+# the inverse: 1.06 at 1 MHz, 1.08 at 2, 1.17 at 4).  1 / the measured response, never a boost; decoded luma only.
+# PALDEC_LUMA_EQ=0: off (= v6_2sat).  Measured over the whole TBC (not the --start/--frames chunk) so chunks agree.
+LUMA_EQ = os.environ.get('PALDEC_LUMA_EQ', '1') == '1'
+if LUMA_EQ:
+    import lumaeq
+    _resp, _neq, _loc = lumaeq.measure(a.tbc, channel_inverse)
+    if _resp is None:
+        log('luma EQ: no multiburst found (%d frames) - off' % _neq)
+    else:
+        _eq = lumaeq.eq_curve(_resp, OW)
+        _lp = _eq if _lp is None else (_lp * _eq).astype(np.float32)
+        _fq = np.fft.rfftfreq(OW, 1 / 17.734475)
+        log('luma EQ: multiburst field %d line %d, %d frames; response after deghost %s at %s MHz -> gain %s at 1/2/3/4/5 MHz'
+            % (_loc[0], _loc[1] + 1, _neq, np.round(_resp, 3).tolist(), list(lumaeq.F0),
+               [round(float(_eq[np.argmin(abs(_fq - q))]), 3) for q in (1, 2, 3, 4, 5)]))
 
 # ---- 4+5: per window of frames, pick a decoder per frame ----------------------
 #   film / held stills (same scene as a neighbour, both fields one instant):
@@ -455,8 +473,28 @@ def _ghost_coef(Yd, Yk, Yp, Yn):
     return g - GH_S2 / n2
 
 
+# v6_2 (2026-10-30): frames whose output is ld-chroma-decoder's own picture (interlaced frames with --video 0, video
+# solves sent back by the saturation / ghost guards) took its chroma scale on the DE-SMEARED TBC: the deghost inverse
+# G lifts 4.43 MHz by 1.18 (deghost.py), so on Community South's EBU bars it reads chroma 1.094 (U 1.105, V 1.084)
+# against the model solves' 1.003 (U 1.020, V 0.989; GU/GV of model_params.json are set on these bars).  A guard
+# fallback frame was therefore ~9% more saturated than the solved frames around it.  Their chroma is scaled to the
+# model's: U x0.923, V x0.913 = solve / transform3d on the same de-smeared bars (decoder-to-decoder, so independent of
+# the disc channel).  PALDEC_T3_CGAIN=1,1 restores v6_1.
+T3_CGAIN = [float(v) for v in os.environ.get('PALDEC_T3_CGAIN', '0.923,0.913').split(',')]
+T3SET = set()        # frames (this window) whose output chroma is transform2d / transform3d's
+
+
+def t3_chroma(x):
+    if T3_CGAIN == [1.0, 1.0]:
+        return x
+    x = np.array(x, np.float32, copy=True)
+    x[1] = (x[1] - 32768.) * T3_CGAIN[0] + 32768.; x[2] = (x[2] - 32768.) * T3_CGAIN[1] + 32768.
+    return x
+
+
 def decode_window(i0, F2, F3):
     """F2/F3: dict frame -> init (transform2d / transform3d).  Returns dict frame -> output."""
+    T3SET.clear()
     idx = sorted(F2)
     res = {}
     held = set(); fbf = set()
@@ -486,7 +524,7 @@ def decode_window(i0, F2, F3):
     for i in idx:
         if inter[i]:
             if cur: runs.append(cur); cur = []
-            res[i] = F3[i] if F3 else F2[i]; stats['interlaced'] += 1
+            res[i] = F3[i] if F3 else F2[i]; stats['interlaced'] += 1; T3SET.add(i)
             vids.append(i)
             continue
         if cur and same[i]:
@@ -561,7 +599,7 @@ def decode_window(i0, F2, F3):
                 # its outlier blocks, the moving region, keep each frame's own video solution): Countryside talking-
                 # head insets, all-video flat grain 183 vs v6_0's averaged 117.
                 for i in r:
-                    film_res[i] = res[i]; res[i] = F3[i]; vids.append(i); inter[i] = True
+                    film_res[i] = res[i]; res[i] = F3[i]; vids.append(i); inter[i] = True; T3SET.add(i)
                 stats['film'] -= len(r); stats['interlaced'] += len(r)
                 stats['local_video'] = stats.get('local_video', 0) + len(r)
                 local_runs.append(r)
@@ -627,6 +665,9 @@ def decode_window(i0, F2, F3):
                                 stats['fb_filled'] = stats.get('fb_filled', 0) + 1; fbf.add(kk)
                             else:
                                 x = F3[kk]
+                            T3SET.add(kk)
+                        else:
+                            T3SET.discard(kk)
                         res[kk] = x
                 stats['video_solved'] = stats.get('video_solved', 0) + len(core)
     if LOCAL_HELD:
@@ -644,7 +685,7 @@ def decode_window(i0, F2, F3):
             finally:
                 O.HELD_T = _t
             del C, cu, cv
-            for i, x in zip(r, o): res[i] = x
+            for i, x in zip(r, o): res[i] = x; T3SET.discard(i)
             held.update(r)
             stats['local_held'] = stats.get('local_held', 0) + len(r)
             print(f"[newdecode] local-motion held {r[0]}-{r[-1]} outblocks {O.HELD_DEBUG['outblocks']}", file=sys.stderr)
@@ -719,8 +760,10 @@ while w0 < nfr:
     res = decode_window(w0, F2, F3)
     for i in range(w0, w1):
         x = res[i]
-        if a.luma_lpf:
-            x = x.copy(); x[0] = np.fft.irfft(np.fft.rfft(x[0], axis=1) * _lp, OW, axis=1)
+        if i in T3SET:          # v6_2: transform3d / 2d output to the model's chroma scale
+            x = t3_chroma(x)
+        if _lp is not None:
+            x = np.array(x, np.float32, copy=True); x[0] = np.fft.irfft(np.fft.rfft(x[0], axis=1) * _lp, OW, axis=1)
         out.write(b'FRAME\n'); out.write(np.clip(np.round(x), 0, 65535).astype('<u2').tobytes())
     log(f'frame {w1}/{nfr}  {stats}')
     w0 = w1

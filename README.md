@@ -53,6 +53,14 @@ samples on the GPU.
 - **Dropouts (`--dropout_mask 1`):** flagged dropouts carry no data weight in the solve. They are then
   filled from the clean rows above and below, and from the previous and next frames where the picture
   is static. See `newdecode/README_dropout.txt` for the measurements.
+- **Fallback chroma scale:** frames output by transform2d/3d (interlaced frames, guard fallbacks) are put on
+  the model's chroma scale (U x0.923, V x0.913; `PALDEC_T3_CGAIN`), since the deghost inverse lifts
+  4.43 MHz by ~1.18 and those frames were ~9% more saturated than the solved frames around them.
+- **Luma equaliser (`lumaeq.py`):** the deghost inverse also lifts luma above ~1 MHz while the real
+  record/playback chain is flatter than its smear model. The chain's response is measured from the disc's
+  own multiburst VITS (Domesday: field 0 line 20), over frames spread across the whole TBC so chunks agree,
+  and the decoded luma is divided by it: never a boost, floor 0.75, off when no multiburst is found.
+  On Community South that is x0.95 / 0.93 / 0.89 / 0.87 at 1 / 2 / 3 / 4 MHz. `PALDEC_LUMA_EQ=0` turns it off.
 
 `newdecode/model_params.json` holds the carrier calibration. `vidsplice.py` re-solves video frames of an
 existing master offline.
@@ -73,6 +81,7 @@ pipeline/
   stack_quality.py         predicted stack noise from a stack log (QC gate)
   probe_v4300_spur.py      spur probe for new captures; results in spur_probe.txt
 newdecode/                 the decoder, stillweave.py (PVF weave)
+orc-plugin/                decode-orc sink stage that runs newdecode (PAL), see orc-plugin/README.md
 pvf/                       PVF writer and verifier
 quality/                   synthetic known-truth benchmark, per-field/per-frame measures, quality.db
 ```
