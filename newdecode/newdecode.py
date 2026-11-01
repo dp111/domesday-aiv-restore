@@ -399,19 +399,42 @@ if a.luma_lpf:
 # above ~1 MHz by up to 1.18 while the real record/playback chain is much flatter than its smear model (South after
 # the inverse: 1.06 at 1 MHz, 1.08 at 2, 1.17 at 4).  1 / the measured response, never a boost; decoded luma only.
 # PALDEC_LUMA_EQ=0: off (= v6_2sat).  Measured over the whole TBC (not the --start/--frames chunk) so chunks agree.
+# v6_4 (2026-11-01): the response follows disc position (South 4 MHz 1.18-1.20 inner -> 1.03-1.07 past ~14k
+# frames), so by default the curve is per window of frames (lumaeq.measure_table, cached next to the TBC) and
+# interpolated per frame; PALDEC_LUMA_EQ_MODE=global = v6_3's single curve.
 LUMA_EQ = os.environ.get('PALDEC_LUMA_EQ', '1') == '1'
+_eqt = None
 if LUMA_EQ:
     import lumaeq
-    _resp, _neq, _loc = lumaeq.measure(a.tbc, channel_inverse)
-    if _resp is None:
-        log('luma EQ: no multiburst found (%d frames) - off' % _neq)
+    _fq = np.fft.rfftfreq(OW, 1 / 17.734475)
+    _ix = [int(np.argmin(abs(_fq - q))) for q in (1, 2, 3, 4, 5)]
+    if lumaeq.MODE == 'global':
+        _resp, _neq, _loc = lumaeq.measure(a.tbc, channel_inverse)
+        if _resp is None:
+            log('luma EQ: no multiburst found (%d frames) - off' % _neq)
+        else:
+            _eq = lumaeq.eq_curve(_resp, OW)
+            _lp = _eq if _lp is None else (_lp * _eq).astype(np.float32)
+            log('luma EQ: multiburst field %d line %d, %d frames; response after deghost %s at %s MHz -> gain %s at 1/2/3/4/5 MHz'
+                % (_loc[0], _loc[1] + 1, _neq, np.round(_resp, 3).tolist(), list(lumaeq.F0),
+                   [round(float(_eq[q]), 3) for q in _ix]))
     else:
-        _eq = lumaeq.eq_curve(_resp, OW)
-        _lp = _eq if _lp is None else (_lp * _eq).astype(np.float32)
-        _fq = np.fft.rfftfreq(OW, 1 / 17.734475)
-        log('luma EQ: multiburst field %d line %d, %d frames; response after deghost %s at %s MHz -> gain %s at 1/2/3/4/5 MHz'
-            % (_loc[0], _loc[1] + 1, _neq, np.round(_resp, 3).tolist(), list(lumaeq.F0),
-               [round(float(_eq[np.argmin(abs(_fq - q))]), 3) for q in (1, 2, 3, 4, 5)]))
+        _d = lumaeq.measure_table(a.tbc, channel_inverse, key_extra=dict(deghost=bool(DEGHOST_ON)), log=log)
+        if _d is None:
+            log('luma EQ: no multiburst found - off')
+        else:
+            _eqt = lumaeq.Table(_d, OW)
+            _G = _eqt.G[:, _ix]
+            _nm = sum(r is None for r in _d['raw'])
+            _ws = [w for w in range(len(_d['centres'])) if _d['centres'][w] + _d['win'] / 2 > a.start and _d['centres'][w] - _d['win'] / 2 < end]
+            _r3 = lambda v: [round(float(q), 3) for q in v]
+            log('luma EQ (per window): multiburst field %d line %d; %d windows x %d frames, %d sampled each, %d without a usable '
+                'multiburst (-> neighbours); %s (measured in %.1f s).  Whole-TBC response %s at %s MHz.  Gain at 1/2/3/4/5 MHz: '
+                'min %s max %s; this chunk (frames %d-%d) %s .. %s'
+                % (_d['loc'][0], _d['loc'][1] + 1, len(_d['centres']), _d['win'], _d['per_win'], _nm,
+                   'from cache ' + _d['cached'] if _d.get('cached') else 'new', _d['secs'] or 0, _r3(_d['glob']),
+                   list(lumaeq.F0), _r3(_G.min(0)), _r3(_G.max(0)), a.start, end - 1, _r3(_G[_ws[0]]), _r3(_G[_ws[-1]])))
+            log('luma EQ 4 MHz gain by window: ' + ' '.join('%.3f' % g for g in _G[:, 3]))
 
 # ---- 4+5: per window of frames, pick a decoder per frame ----------------------
 #   film / held stills (same scene as a neighbour, both fields one instant):
@@ -762,8 +785,12 @@ while w0 < nfr:
         x = res[i]
         if i in T3SET:          # v6_2: transform3d / 2d output to the model's chroma scale
             x = t3_chroma(x)
-        if _lp is not None:
-            x = np.array(x, np.float32, copy=True); x[0] = np.fft.irfft(np.fft.rfft(x[0], axis=1) * _lp, OW, axis=1)
+        _lpi = _lp
+        if _eqt is not None:    # v6_4: per-frame luma EQ (TBC frame index a.start + i)
+            _gi = _eqt.gain(a.start + i)
+            _lpi = _gi if _lp is None else (_lp * _gi).astype(np.float32)
+        if _lpi is not None:
+            x = np.array(x, np.float32, copy=True); x[0] = np.fft.irfft(np.fft.rfft(x[0], axis=1) * _lpi, OW, axis=1)
         out.write(b'FRAME\n'); out.write(np.clip(np.round(x), 0, 65535).astype('<u2').tobytes())
     log(f'frame {w1}/{nfr}  {stats}')
     w0 = w1

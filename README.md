@@ -60,7 +60,10 @@ samples on the GPU.
   record/playback chain is flatter than its smear model. The chain's response is measured from the disc's
   own multiburst VITS (Domesday: field 0 line 20), over frames spread across the whole TBC so chunks agree,
   and the decoded luma is divided by it: never a boost, floor 0.75, off when no multiburst is found.
-  On Community South that is x0.95 / 0.93 / 0.89 / 0.87 at 1 / 2 / 3 / 4 MHz. `PALDEC_LUMA_EQ=0` turns it off.
+  The decoded response changes with disc radius (ld-decode's EQ servos settle differently: on Community South
+  4 MHz reads 1.17 after deghost at the start of the side, 1.03-1.05 from frame ~12000), so the equaliser is
+  measured per 750-frame window (16 frames each, median of 3 windows), interpolated per frame and cached in
+  `<tbc>.lumaeq.json`. `PALDEC_LUMA_EQ=0` turns it off; `PALDEC_LUMA_EQ_MODE=global` uses one whole-TBC curve.
 
 `newdecode/model_params.json` holds the carrier calibration. `vidsplice.py` re-solves video frames of an
 existing master offline.
