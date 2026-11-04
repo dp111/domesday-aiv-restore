@@ -141,6 +141,7 @@ Every stage is resumable. Control files in `$WORK/state`:
 | `wait/<slot>.<order>` | a side queued for a slot ("<side> <pid>"); an entry whose side died is dropped, an **empty** file is a manual hold of that slot for every later side |
 | `gpu.lock` | the `ND_GPULOCK` flock (default here; set `ND_GPULOCK` to one shared path, e.g. `/run/lock/aiv-gpu.lock`, so pipelines with separate `WORK` dirs on one machine never run two newdecodes at once) |
 | `ND_CD` | a decoder directory that overrides `ND_DIR` for every later newdecode run, also in side chains already running |
+| `ND_CD.<side>` | the same for one side only; overrides `ND_CD` |
 | `HOLD.<side>` | set by a failed QC gate; remove it to continue that side |
 | `AUTODELETE` | deletes each side's capture decodes after its stack |
 

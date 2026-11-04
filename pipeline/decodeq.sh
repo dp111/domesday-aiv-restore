@@ -54,7 +54,9 @@ decode(){ # <side> <ldf> <cap> <dir>
   local s=$1 ldf=$2 c=$3 w=$4/${1}_$3 n want spur= ca=$CAPS/$1/$3
   echo "$BASHPID" > "$ca.pid"
   [ "$(spur_of "$ldf")" = 1 ] && spur=--V4300D_coherent_subtract
-  want=$(( $(ldf_frames "$ldf") * FB / 100 * $([[ $ldf == *_CLV_* ]] && echo 93 || echo 97) ))
+  # judged by the side's shortest named capture: some captures are named for a full disc (00001-54000) but the
+  # side ends earlier (EcoDisc Side2 ends at 35501 on every copy)
+  want=$(( $(for l in $(side_ldfs "$s"); do ldf_frames "$l"; done | sort -n | head -1) * FB / 100 * $([[ $ldf == *_CLV_* ]] && echo 93 || echo 97) ))
   rm -f "$w.tbc" "$w.tbc.json" "$w.tbc.db" "$w.pcm" "$w.efm"
   log "$s $c start -> $4 ($(basename "$ldf"), spur ${spur:+subtract}${spur:-none})"
   ( cd "$LD" && LDDECODE_EFM_GEARSHIFT=0 "$PY" ld-decode --PAL -t 4 $LD_OPTS $spur --noEFM "$ldf" "$w" > "$w.declog" 2>&1 )
@@ -65,6 +67,9 @@ decode(){ # <side> <ldf> <cap> <dir>
     n=$(stat -c %s "$w.tbc" 2>/dev/null || echo 0)
   fi
   # rc is 0 even when numba crashes, so judge by the output size
+  # the .ldf reader can fail with ENOMEM while a stack and newdecode run beside it: retry once
+  if [ "$n" -lt "$want" ] && [ -z "${5:-}" ] && grep -q 'Cannot allocate memory' "$w.declog"; then
+    log "$s $c out of memory at $n bytes - retrying in 10 min"; sleep 600; decode "$1" "$2" "$3" "$4" retry; return; fi
   if [ "$n" -lt "$want" ]; then log "$s $c FAILED ($n bytes, want >= $want; see $w.declog)"; touch "$ca.failed"; rm -f "$ca.pid"; return 1; fi
   "$PY" "$LD/scripts/db2json.py" "$w.tbc.db" > /dev/null 2>&1
   [ -s "$w.tbc.json" ] || { log "$s $c: db2json failed"; touch "$ca.failed"; rm -f "$ca.pid"; return 1; }

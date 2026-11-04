@@ -29,6 +29,7 @@ B=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$B/../config.sh"
 CD=${ND_CD:-$ND_DIR}   # ND_EXTRA="--dropout_mask 1": newdecode/README_dropout.txt
 [ -s "$WORK/state/ND_CD" ] && CD=$(cat "$WORK/state/ND_CD")
+[ -s "$WORK/state/ND_CD.$S" ] && CD=$(cat "$WORK/state/ND_CD.$S")   # one side only
 OUT=$V7_OUT
 C=$SCR/ndc
 LOG=${ND_LOG:-$WORK/pipeline.log}
